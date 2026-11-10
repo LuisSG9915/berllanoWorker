@@ -33,6 +33,7 @@ builder.Services.AddCors(options =>
 });
 
 builder.Services.AddSingleton<IImpresionService, ImpresionService>();
+builder.Services.AddSingleton<ITerminalService, TerminalService>();
 
 builder.Services.AddControllers(options =>
 {

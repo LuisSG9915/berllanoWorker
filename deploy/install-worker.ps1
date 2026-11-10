@@ -70,6 +70,10 @@ if (Test-Path $sumatraOrigen) {
     Write-Warning "SumatraPDF.exe no esta en $PublishDir\tools\ - /api/impresion/documento no funcionara hasta copiarlo."
 }
 
+# --- 1c. Carpeta de logs de BanorteWorker.exe (ruta fija en su codigo) ---
+New-Item -ItemType Directory -Force -Path "C:\asesor\BanortePOS\Logs" | Out-Null
+Write-Host "      Carpeta de logs C:\asesor\BanortePOS\Logs lista" -ForegroundColor Green
+
 # --- 2. Configurar appsettings.json ---
 $appSettingsPath = Join-Path $InstallDir "appsettings.json"
 $json = Get-Content $appSettingsPath -Raw | ConvertFrom-Json
