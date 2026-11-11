@@ -12,17 +12,23 @@ namespace berllanoWorker.Services;
 public class ImpresionService : IImpresionService
 {
     private readonly ILogger<ImpresionService> _logger;
+    private readonly IConfiguracionCajaService _configCaja;
     private readonly int _codePage;
     private readonly int _columnas;
     private readonly string _sumatraPath;
     private readonly int _timeoutDescargaSeg;
     private readonly long _tamMaximoBytes;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
+    // Un lock por nombre FISICO resuelto: Miniprinter_Caja1 y _Caja2 imprimen
+    // en paralelo; solo se bloquea la misma impresora (423).
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly HttpClient _httpClient = new();
 
-    public ImpresionService(IConfiguration configuration, ILogger<ImpresionService> logger)
+    public ImpresionService(IConfiguration configuration, ILogger<ImpresionService> logger,
+        IConfiguracionCajaService configCaja)
     {
         _logger = logger;
+        _configCaja = configCaja;
         _codePage = configuration.GetValue("Impresion:CodePage", 858);
         _columnas = configuration.GetValue("Impresion:Columnas", 40);
         _sumatraPath = configuration.GetValue<string>("Impresion:SumatraPdfPath") ?? "tools\\SumatraPDF.exe";
@@ -41,24 +47,34 @@ public class ImpresionService : IImpresionService
 
     public async Task ImprimirTicketAsync(TicketRequestDto request)
     {
-        ValidarImpresora(request.Recurso);
+        // Alias/vacio -> lookup cat_RecursosWorker (default "Tickets");
+        // nombre fisico instalado -> passthrough directo.
+        var recurso = string.IsNullOrWhiteSpace(request.Recurso) ? "Tickets" : request.Recurso;
+        var impresora = await _configCaja.ResolverImpresoraCajaAsync(
+            request.Sucursal, request.Caja, recurso, request.ForzarRecarga);
+
+        ValidarImpresora(impresora);
 
         var bytes = EscPosBuilder.Build(request.TicketDataset, _codePage, _columnas);
 
-        await EjecutarConBloqueo(request.Recurso, () =>
+        await EjecutarConBloqueo(impresora, () =>
         {
-            if (!RawPrinterHelper.SendBytesToPrinter(request.Recurso, bytes))
+            if (!RawPrinterHelper.SendBytesToPrinter(impresora, bytes))
                 throw new HardwareDisconnectedException(
-                    $"La impresora '{request.Recurso}' no respondio al enviar el ticket. Verifica que este encendida y conectada.");
+                    $"La impresora '{impresora}' no respondio al enviar el ticket. Verifica que este encendida y conectada.");
 
-            _logger.LogInformation("Ticket enviado a '{Recurso}' ({Bytes} bytes)", request.Recurso, bytes.Length);
+            _logger.LogInformation("Ticket enviado a '{Impresora}' ({Bytes} bytes)", impresora, bytes.Length);
             return Task.CompletedTask;
         });
     }
 
     public async Task ImprimirDocumentoAsync(DocumentoRequestDto request)
     {
-        ValidarImpresora(request.Recurso);
+        var recurso = string.IsNullOrWhiteSpace(request.Recurso) ? "Documentos" : request.Recurso;
+        var impresora = await _configCaja.ResolverImpresoraCajaAsync(
+            request.Sucursal, request.Caja, recurso, request.ForzarRecarga);
+
+        ValidarImpresora(impresora);
 
         if (!Uri.TryCreate(request.UrlFile, UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
@@ -69,10 +85,10 @@ public class ImpresionService : IImpresionService
         {
             await DescargarArchivoAsync(uri, archivoTemp);
 
-            await EjecutarConBloqueo(request.Recurso, () =>
+            await EjecutarConBloqueo(impresora, () =>
             {
-                ImprimirPdfConSumatra(request.Recurso, archivoTemp);
-                _logger.LogInformation("Documento {Url} impreso en '{Recurso}'", request.UrlFile, request.Recurso);
+                ImprimirPdfConSumatra(impresora, archivoTemp);
+                _logger.LogInformation("Documento {Url} impreso en '{Impresora}'", request.UrlFile, impresora);
                 return Task.CompletedTask;
             });
         }

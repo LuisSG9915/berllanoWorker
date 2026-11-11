@@ -19,8 +19,19 @@ public class TicketLineaDto
 
 public class TicketRequestDto
 {
+    // Nombre fisico de impresora Windows O alias de recurso en
+    // cat_RecursosWorker ("Tickets", "Documentos", custom). Vacio -> "Tickets".
     [JsonPropertyName("recurso")]
     public string Recurso { get; set; } = string.Empty;
+
+    [JsonPropertyName("sucursal")]
+    public int? Sucursal { get; set; }
+
+    [JsonPropertyName("caja")]
+    public int? Caja { get; set; }
+
+    [JsonPropertyName("forzar_recarga")]
+    public bool ForzarRecarga { get; set; } = false;
 
     [JsonPropertyName("ticket_dataset")]
     public List<TicketLineaDto> TicketDataset { get; set; } = new();
@@ -32,8 +43,18 @@ public class DocumentoRequestDto
     [JsonPropertyName("url_file")]
     public string UrlFile { get; set; } = string.Empty;
 
+    // Igual que ticket: nombre fisico o alias. Vacio -> "Documentos".
     [JsonPropertyName("recurso")]
     public string Recurso { get; set; } = string.Empty;
+
+    [JsonPropertyName("sucursal")]
+    public int? Sucursal { get; set; }
+
+    [JsonPropertyName("caja")]
+    public int? Caja { get; set; }
+
+    [JsonPropertyName("forzar_recarga")]
+    public bool ForzarRecarga { get; set; } = false;
 }
 
 // Respuesta de GET /api/sistema/identidad
@@ -47,10 +68,19 @@ public class IdentidadDto
     public string Status { get; set; } = "ONLINE";
 }
 
-// Overrides opcionales de TerminalBanorte por peticion; si vienen vacios
-// se usan los valores de appsettings.json
+// Overrides opcionales por peticion. sucursal/caja seleccionan la fila de
+// cberp.dbo.t_banorte_usuarios; los campos manuales ganan sobre la fila.
 public class TerminalConfigOverrideDto
 {
+    [JsonPropertyName("sucursal")]
+    public int? Sucursal { get; set; }
+
+    [JsonPropertyName("caja")]
+    public int? Caja { get; set; }
+
+    [JsonPropertyName("forzar_recarga")]
+    public bool ForzarRecarga { get; set; } = false;
+
     public string? IpTerminal { get; set; }
     public string? Puerto { get; set; }
     public string? Usuario { get; set; }
@@ -115,6 +145,15 @@ public class TerminalTransaccionResponseDto
     // Eco de la "referencia" que envio el cliente en /cobro (numControl
     // interno siempre lo genera el worker: ddHHmmss + sufijo).
     public string ReferenciaCliente { get; set; } = string.Empty;
+
+    // Identificacion de con que caja/afiliacion se proceso la operacion
+    // (resueltos desde t_banorte_usuarios u overrides).
+    public int Sucursal { get; set; }
+    public int Caja { get; set; }
+    public string IpTerminal { get; set; } = string.Empty;
+    public string IdTerminal { get; set; } = string.Empty;
+    public string Afiliacion { get; set; } = string.Empty;
+
     public string NumControl { get; set; } = string.Empty;
     public string UuidSesion { get; set; } = string.Empty;
     public decimal Monto { get; set; }
@@ -135,6 +174,53 @@ public class TerminalTransaccionResponseDto
     public string EmvLabel { get; set; } = string.Empty;
     public string RawResponse { get; set; } = string.Empty;
     public string UltimaTraza { get; set; } = string.Empty;
+}
+
+// Credenciales ya resueltas para operar la terminal (ConfiguracionCajaService
+// -> TerminalService). Nunca se serializa al cliente: trae Password.
+public class TerminalCredencialesDto
+{
+    public string IpTerminal { get; set; } = string.Empty;
+    public int Puerto { get; set; }
+    public string PuertoStr { get; set; } = "1818";
+    public string Usuario { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public string Modo { get; set; } = "AUT";
+    public string Afiliacion { get; set; } = string.Empty;
+    public string IdTerminal { get; set; } = string.Empty;
+    public int Sucursal { get; set; }
+    public int Caja { get; set; }
+    public string Origen { get; set; } = string.Empty;
+}
+
+// GET /api/sistema/cajas: resumen consolidado por caja (impresoras + terminal)
+public class RecursoCajaDto
+{
+    public string Recurso { get; set; } = string.Empty;
+    public string NombreDispositivoLocal { get; set; } = string.Empty;
+    public bool InstaladaLocal { get; set; }
+}
+
+public class CajaResumenDto
+{
+    public int Caja { get; set; }
+    public List<RecursoCajaDto> Impresoras { get; set; } = new();
+    public TerminalCajaDto? Terminal { get; set; }
+    public string? IpPinpad { get; set; }
+}
+
+// GET /api/terminal/cajas?sucursal=N -> filas de t_banorte_usuarios (sin pass)
+public class TerminalCajaDto
+{
+    public int Cia { get; set; }
+    public int Sucursal { get; set; }
+    public int Caja { get; set; }
+    public string IdTerminal { get; set; } = string.Empty;
+    public string Puerto { get; set; } = string.Empty;
+    public string Afiliacion { get; set; } = string.Empty;
+    public string Usuario { get; set; } = string.Empty;
+    public string Modo { get; set; } = string.Empty;
+    public string Origen { get; set; } = string.Empty;
 }
 
 

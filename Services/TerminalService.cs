@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
@@ -10,41 +11,47 @@ using berllanoWorker.Models;
 
 namespace berllanoWorker.Services;
 
-// Singleton: el pinpad Banorte/Payworks es un recurso exclusivo por LAN (un
-// socket TCP a la vez). Un solo Semaforo(1,1) serializa las 5 operaciones;
-// el wrapper COM se invoca fuera de proceso via BanorteWorker.exe.
+// Singleton: cada pinpad Banorte/Payworks es un recurso exclusivo por LAN
+// (un socket TCP a la vez). Un Semaforo(1,1) POR IP serializa operaciones
+// concurrentes hacia la misma terminal; el wrapper se invoca via
+// BanorteWorker.exe (proceso) o BanortePayworksWrapper.dll (reflection).
+// Credenciales/config por (sucursal,caja): IConfiguracionCajaService (cberp).
 public class TerminalService : ITerminalService
 {
-    private readonly SemaphoreSlim _pinpadLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _locksPorTerminal =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogger<TerminalService> _logger;
+    private readonly IConfiguracionCajaService _configCaja;
 
     private readonly string _rutaWorkerExe;
     private readonly string _rutaWrapperDll;
-    private readonly string _ipTerminal;
-    private readonly string _puerto;
-    private readonly string _usuario;
-    private readonly string _password;
-    private readonly string _afiliacion;
-    private readonly string _modo;
     private readonly int _timeoutSegundos;
     private readonly bool _validarPingTcpPrevio;
 
-    private sealed record ConfigEfectiva(string Ip, int Puerto, string PuertoStr,
-        string Usuario, string Password, string Modo, string Afiliacion);
+    // Alias de la credencial resuelta (mantiene la firma interna corta).
+    private sealed record ConfigEfectiva(TerminalCredencialesDto D)
+    {
+        public string Ip => D.IpTerminal;
+        public int Puerto => D.Puerto;
+        public string PuertoStr => D.PuertoStr;
+        public string Usuario => D.Usuario;
+        public string Password => D.Password;
+        public string Modo => D.Modo;
+        public string Afiliacion => D.Afiliacion;
+        public int Sucursal => D.Sucursal;
+        public int Caja => D.Caja;
+        public string IdTerminal => D.IdTerminal;
+    }
 
-    public TerminalService(IConfiguration configuration, ILogger<TerminalService> logger)
+    public TerminalService(IConfiguration configuration, ILogger<TerminalService> logger,
+        IConfiguracionCajaService configCaja)
     {
         _logger = logger;
+        _configCaja = configCaja;
         _rutaWorkerExe = configuration.GetValue<string>("TerminalBanorte:RutaWorkerExe")
             ?? @"C:\asesor\BanortePOS\BanorteWorker.exe";
         _rutaWrapperDll = configuration.GetValue<string>("TerminalBanorte:RutaWrapperDll")
             ?? @"C:\asesor\BanortePOS\BanortePayworksWrapper.dll";
-        _ipTerminal = configuration.GetValue<string>("TerminalBanorte:IpTerminal") ?? string.Empty;
-        _puerto = configuration.GetValue<string>("TerminalBanorte:Puerto") ?? "1818";
-        _usuario = configuration.GetValue<string>("TerminalBanorte:Usuario") ?? string.Empty;
-        _password = configuration.GetValue<string>("TerminalBanorte:Password") ?? string.Empty;
-        _afiliacion = configuration.GetValue<string>("TerminalBanorte:Afiliacion") ?? string.Empty;
-        _modo = configuration.GetValue<string>("TerminalBanorte:Modo") ?? "AUT";
         _timeoutSegundos = configuration.GetValue("TerminalBanorte:TimeoutSegundos", 150);
         _validarPingTcpPrevio = configuration.GetValue("TerminalBanorte:ValidarPingTcpPrevio", true);
 
@@ -60,11 +67,11 @@ public class TerminalService : ITerminalService
         }
     }
 
-    public Task<TerminalTransaccionResponseDto> InicializarLlavesAsync(TerminalLlavesRequestDto request, CancellationToken ct = default)
+    public async Task<TerminalTransaccionResponseDto> InicializarLlavesAsync(TerminalLlavesRequestDto request, CancellationToken ct = default)
     {
-        var cfg = ResolverConfig(request);
+        var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
         var ahora = DateTime.Now;
-        return EjecutarAsync(cfg, "CARGAR_LLAVE",
+        return await EjecutarAsync(cfg, "CARGAR_LLAVE",
             numControl: "KEY" + ahora.ToString("yyyyMMddHHmmss"),
             uuid: "UUID-KEY-" + ahora.ToString("yyyyMMddHHmmss"),
             monto: 0.00m, efectivo: 0.00m, ct);
@@ -74,7 +81,7 @@ public class TerminalService : ITerminalService
     {
         ValidarMonto(request.Monto);
 
-        var cfg = ResolverConfig(request);
+        var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
         var ahora = DateTime.Now;
         var dto = await EjecutarAsync(cfg, "VENTA",
             numControl: ahora.ToString("ddHHmmss") + "B",
@@ -84,13 +91,13 @@ public class TerminalService : ITerminalService
         return dto;
     }
 
-    public Task<TerminalTransaccionResponseDto> RetirarEfectivoAsync(TerminalRetiroRequestDto request, CancellationToken ct = default)
+    public async Task<TerminalTransaccionResponseDto> RetirarEfectivoAsync(TerminalRetiroRequestDto request, CancellationToken ct = default)
     {
         ValidarMonto(request.Monto);
 
-        var cfg = ResolverConfig(request);
+        var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
         var ahora = DateTime.Now;
-        return EjecutarAsync(cfg, "CASHBACK",
+        return await EjecutarAsync(cfg, "CASHBACK",
             numControl: ahora.ToString("ddHHmmss") + "C",
             uuid: "UUID-" + ahora.ToString("yyyyMMddHHmmss") + "-C",
             monto: request.MontoVenta > 0 ? request.MontoVenta : request.Monto,
@@ -109,12 +116,12 @@ public class TerminalService : ITerminalService
                 "El monto debe ser mayor a $0.00 y no exceder $999,999.99.");
     }
 
-    public Task<TerminalTransaccionResponseDto> CancelarTransaccionAsync(TerminalCancelacionRequestDto request, CancellationToken ct = default)
+    public async Task<TerminalTransaccionResponseDto> CancelarTransaccionAsync(TerminalCancelacionRequestDto request, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(request.TransaccionId))
             throw new HardwareValidationException("El campo 'transaccion_id' es obligatorio para cancelar.");
 
-        var cfg = ResolverConfig(request);
+        var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
         var id = request.TransaccionId.Trim();
 
         // Devolucion financiera real: solo si el id es una Referencia
@@ -122,12 +129,12 @@ public class TerminalService : ITerminalService
         if (EsReferenciaPayworks(id) && request.Monto.GetValueOrDefault() > 0)
         {
             ValidarMonto(request.Monto!.Value);
-            return ConBloqueoAsync(cfg,
+            return await ConBloqueoAsync(cfg,
                 token => EjecutarDevolucionWrapperAsync(cfg, id, request.Monto.Value, token), ct);
         }
 
         // Caso general: reset de sesion EMV (CANCELAR / PPSendTxn(3)).
-        return EjecutarAsync(cfg, "CANCELAR",
+        return await EjecutarAsync(cfg, "CANCELAR",
             numControl: id,
             uuid: "UUID-CAN-" + DateTime.Now.ToString("yyyyMMddHHmmss"),
             monto: 0.00m, efectivo: 0.00m, ct);
@@ -136,43 +143,29 @@ public class TerminalService : ITerminalService
     private static bool EsReferenciaPayworks(string id)
         => id.Length == 12 && id.All(char.IsDigit);
 
-    public Task<TerminalTransaccionResponseDto> VerificarTransaccionAsync(TerminalVerificarRequestDto request, CancellationToken ct = default)
+    public async Task<TerminalTransaccionResponseDto> VerificarTransaccionAsync(TerminalVerificarRequestDto request, CancellationToken ct = default)
     {
         // Equivalente a la validacion numControlOriginal = "" del VBA
         if (string.IsNullOrWhiteSpace(request.NumeroControl))
             throw new HardwareValidationException("El campo 'numero_control' es obligatorio para verificar.");
 
-        var cfg = ResolverConfig(request);
-        return EjecutarAsync(cfg, "VERIFICACION",
+        var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
+        return await EjecutarAsync(cfg, "VERIFICACION",
             numControl: request.NumeroControl.Trim(),
             uuid: "UUID-VER-" + DateTime.Now.ToString("yyyyMMddHHmmss"),
             monto: 0.00m, efectivo: 0.00m, ct);
     }
 
-    // Combina overrides del request con los defaults de TerminalBanorte.
-    // Ip/Usuario/Password vacios -> 422 (igual que Inicializar() del VBA).
-    private ConfigEfectiva ResolverConfig(TerminalConfigOverrideDto? o)
-    {
-        var ip = PrimeroNoVacio(o?.IpTerminal, _ipTerminal);
-        var puertoStr = PrimeroNoVacio(o?.Puerto, _puerto);
-        var usuario = PrimeroNoVacio(o?.Usuario, _usuario);
-        var password = PrimeroNoVacio(o?.Password, _password);
-        var modo = PrimeroNoVacio(o?.Modo, _modo);
-        var afiliacion = PrimeroNoVacio(o?.Afiliacion, _afiliacion);
+    // Resuelve credenciales/destino de la terminal via el servicio central
+    // multi-caja (t_banorte_usuarios + recurso 'TerminalBanorte' en
+    // cat_RecursosWorker + overrides del request + fallback local de esta PC).
+    private async Task<ConfigEfectiva> ResolverConfiguracionTerminalAsync(
+        TerminalConfigOverrideDto request, CancellationToken ct)
+        => new(await _configCaja.ResolverTerminalCajaAsync(request, ct));
 
-        if (string.IsNullOrWhiteSpace(ip) || string.IsNullOrWhiteSpace(usuario) || string.IsNullOrWhiteSpace(password))
-            throw new HardwareValidationException(
-                "Configuracion de terminal incompleta: IpTerminal, Usuario y Password son obligatorios " +
-                "(seccion TerminalBanorte en appsettings.json o overrides en el request).");
-
-        if (!int.TryParse(puertoStr, NumberStyles.None, CultureInfo.InvariantCulture, out var puerto) || puerto <= 0 || puerto > 65535)
-            throw new HardwareValidationException($"Puerto de terminal invalido: '{puertoStr}'.");
-
-        return new ConfigEfectiva(ip, puerto, puertoStr, usuario, password, modo, afiliacion);
-    }
-
-    private static string PrimeroNoVacio(string? primero, string fallback)
-        => string.IsNullOrWhiteSpace(primero) ? fallback : primero.Trim();
+    // GET /api/terminal/cajas: delega al servicio central (sin pass_banorte).
+    public Task<List<TerminalCajaDto>> ObtenerCajasAsync(int? sucursal, CancellationToken ct = default)
+        => _configCaja.ObtenerCajasTerminalAsync(sucursal, ct);
 
     private Task<TerminalTransaccionResponseDto> EjecutarAsync(
         ConfigEfectiva cfg, string operacion, string numControl, string uuid,
@@ -272,29 +265,41 @@ public class TerminalService : ITerminalService
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetDllDirectory(string lpPathName);
 
-    // Semaforo exclusivo del pinpad + chequeo TCP previo para cualquier
-    // operacion que hable con la terminal (exe o wrapper in-proc).
+    // Semaforo exclusivo POR pinpad (clave: IP) + chequeo TCP previo para
+    // cualquier operacion que hable con la terminal (exe o wrapper in-proc).
     private async Task<TerminalTransaccionResponseDto> ConBloqueoAsync(
         ConfigEfectiva cfg, Func<CancellationToken, Task<TerminalTransaccionResponseDto>> accion, CancellationToken ct)
     {
-        // Rechazo inmediato con 423 si el pinpad ya esta en uso.
-        if (!await _pinpadLock.WaitAsync(0, ct))
+        var pinpadLock = _locksPorTerminal.GetOrAdd(cfg.Ip, _ => new SemaphoreSlim(1, 1));
+
+        // Rechazo inmediato con 423 si ESTA terminal ya esta en uso (otras
+        // IPs pueden operar en paralelo en un equipo multi-caja).
+        if (!await pinpadLock.WaitAsync(0, ct))
             throw new HardwareBusyException(
-                "La terminal Banorte esta procesando otra operacion. Reintenta en unos segundos.");
+                $"La terminal de la Caja {cfg.Caja} ({cfg.Ip}) esta ocupada procesando otra operacion. " +
+                "Reintenta en unos segundos.");
 
         try
         {
             if (_validarPingTcpPrevio)
                 await ValidarConexionTcpAsync(cfg.Ip, cfg.Puerto, ct);
 
-            return await accion(ct);
+            var dto = await accion(ct);
+
+            // Eco de la resolucion para que el cliente confirme la caja real.
+            dto.Sucursal = cfg.Sucursal;
+            dto.Caja = cfg.Caja;
+            dto.IpTerminal = cfg.Ip;
+            dto.IdTerminal = cfg.IdTerminal;
+            dto.Afiliacion = cfg.Afiliacion;
+            return dto;
         }
         finally
         {
             // Pausa deliberada antes de liberar: da tiempo a que el socket TCP
             // de la terminal quede libre para la siguiente operacion.
             await Task.Delay(500);
-            _pinpadLock.Release();
+            pinpadLock.Release();
         }
     }
 

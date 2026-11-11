@@ -13,6 +13,10 @@
                             (id generico -> reset de sesion; ref Payworks de 12 digitos
                             + -MontoDevolucion -> DEVOLUCION financiera REAL)
       -NumeroControlVerificar X POST /api/terminal/verificar con numero_control=X
+      -IncluirTicket      POST /api/impresion/ticket a la impresora de la caja
+                          (requiere -Sucursal y -Caja; imprime papel real)
+  Multi-caja (siempre se prueba): GET /api/sistema/cajas, GET /api/terminal/cajas
+  y 422 en cobro+ticket de -CajaInexistente (default 99).
 
 .PARAMETER WorkerKey
   Valor de Worker:WorkerKey del appsettings.json instalado.
@@ -35,19 +39,71 @@ param(
     [string]$InstallDir = "C:\berllanoWorker",
     [decimal]$MontoPrueba = 1.00,
     [decimal]$MontoDevolucion = 0,
+    [int]$Sucursal = 0,
+    [int]$Caja = 0,
     [string]$TransaccionCancelar = "",
     [string]$NumeroControlVerificar = "",
+    [int]$CajaInexistente = 99,
     [switch]$IncluirLlaves,
-    [switch]$IncluirCobro
+    [switch]$IncluirCobro,
+    [switch]$IncluirTicket
 )
 
 $headers = @{ "X-Worker-Key" = $WorkerKey; "Content-Type" = "application/json" }
+if ($Sucursal -gt 0) { $headers["X-Sucursal"] = "$Sucursal" }
+if ($Caja -gt 0)     { $headers["X-Caja"] = "$Caja" }
 $script:fallas = 0
+
+# Sufijo JSON con sucursal/caja para los bodies de POST (los headers ya los cubren,
+# pero el body tiene prioridad si alguien prueba solo con body).
+$scJson = ""
+if ($Sucursal -gt 0 -or $Caja -gt 0) {
+    $partes = @()
+    if ($Sucursal -gt 0) { $partes += "`"sucursal`":$Sucursal" }
+    if ($Caja -gt 0)     { $partes += "`"caja`":$Caja" }
+    $scJson = "," + ($partes -join ",")
+}
 
 function Probar([string]$nombre, [string]$endpoint, [string]$body, [int]$esperado) {
     try {
         $resp = Invoke-WebRequest -Method POST -Uri "$BaseUrl/api/terminal/$endpoint" `
             -Headers $headers -Body $body -TimeoutSec 200 -SkipHttpErrorCheck
+        $code = [int]$resp.StatusCode
+        $detalle = $resp.Content
+    } catch {
+        $code = 0; $detalle = $_.Exception.Message
+    }
+    $ok = ($code -eq $esperado)
+    if (-not $ok) { $script:fallas++ }
+    $color = if ($ok) { "Green" } else { "Red" }
+    $marca = if ($ok) { "OK  " } else { "FAIL" }
+    Write-Host "[$marca] $nombre -> HTTP $code (esperado $esperado)" -ForegroundColor $color
+    if ($detalle.Length -gt 300) { $detalle = $detalle.Substring(0, 300) + "..." }
+    Write-Host "       $detalle" -ForegroundColor DarkGray
+}
+
+function ProbarGet([string]$nombre, [string]$ruta, [int]$esperado) {
+    try {
+        $resp = Invoke-WebRequest -Method GET -Uri "$BaseUrl/$ruta" `
+            -Headers $headers -TimeoutSec 30 -SkipHttpErrorCheck
+        $code = [int]$resp.StatusCode
+        $detalle = $resp.Content
+    } catch {
+        $code = 0; $detalle = $_.Exception.Message
+    }
+    $ok = ($code -eq $esperado)
+    if (-not $ok) { $script:fallas++ }
+    $color = if ($ok) { "Green" } else { "Red" }
+    $marca = if ($ok) { "OK  " } else { "FAIL" }
+    Write-Host "[$marca] $nombre -> HTTP $code (esperado $esperado)" -ForegroundColor $color
+    if ($detalle.Length -gt 300) { $detalle = $detalle.Substring(0, 300) + "..." }
+    Write-Host "       $detalle" -ForegroundColor DarkGray
+}
+
+function ProbarPost([string]$nombre, [string]$ruta, [string]$body, [int]$esperado) {
+    try {
+        $resp = Invoke-WebRequest -Method POST -Uri "$BaseUrl/$ruta" `
+            -Headers $headers -Body $body -TimeoutSec 60 -SkipHttpErrorCheck
         $code = [int]$resp.StatusCode
         $detalle = $resp.Content
     } catch {
@@ -94,6 +150,23 @@ Probar "cobro monto=0 -> 422"        "cobro"       '{"monto":0,"referencia":"T"}
 Probar "cobro sobre techo -> 422"    "cobro"       '{"monto":1500000,"referencia":"T"}' 422
 Probar "cancelacion id vacio -> 422" "cancelacion" '{"transaccion_id":""}'        422
 Probar "verificar ctrl vacio -> 422" "verificar"   '{"numero_control":""}'        422
+
+Write-Host "`n=== MULTI-CAJA (cberp) ===" -ForegroundColor Cyan
+# El body gana sobre los headers X-Sucursal/X-Caja -> forzamos caja 99 en body.
+$sucQ = if ($Sucursal -gt 0) { $Sucursal } else { 1 }
+ProbarGet "GET sistema/cajas?sucursal=$sucQ -> 200" "api/sistema/cajas?sucursal=$sucQ" 200
+ProbarGet "GET terminal/cajas?sucursal=$sucQ -> 200" "api/terminal/cajas?sucursal=$sucQ" 200
+$sucBody = if ($Sucursal -gt 0) { $Sucursal } else { 1 }
+$bodyCajaMala = "{`"sucursal`":$sucBody,`"caja`":$CajaInexistente"
+Probar "cobro caja $CajaInexistente -> 422" "cobro" "$bodyCajaMala,`"monto`":1,`"referencia`":`"X`"}" 422
+ProbarPost "ticket caja $CajaInexistente -> 422" "api/impresion/ticket" `
+    "$bodyCajaMala,`"ticket_dataset`":[{`"consecutivo`":1,`"modo`":`"TEXTO_PLANO`",`"data`":`"x`"}]}" 422
+if ($IncluirTicket -and $Caja -gt 0) {
+    ProbarPost "ticket suc=$sucBody caja=$Caja (imprime)" "api/impresion/ticket" `
+        "{`"sucursal`":$sucBody,`"caja`":$Caja,`"ticket_dataset`":[{`"consecutivo`":1,`"modo`":`"CENTRADO_GRANDE_NEGRITA`",`"data`":`"PRUEBA WORKER`"},{`"consecutivo`":2,`"modo`":`"CORTE_PAPEL`",`"data`":`"`"}]}" 200
+} elseif ($IncluirTicket) {
+    Write-Warning "-IncluirTicket requiere -Sucursal y -Caja"
+}
 
 # IP inalcanzable: el chequeo TCP falla antes de tocar el pinpad -> 503.
 # Dos disparadas a la vez: la primera ocupa el semaforo 3s -> la segunda da 423.

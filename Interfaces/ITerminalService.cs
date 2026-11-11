@@ -9,4 +9,5 @@ public interface ITerminalService
     Task<TerminalTransaccionResponseDto> RetirarEfectivoAsync(TerminalRetiroRequestDto request, CancellationToken ct = default);
     Task<TerminalTransaccionResponseDto> CancelarTransaccionAsync(TerminalCancelacionRequestDto request, CancellationToken ct = default);
     Task<TerminalTransaccionResponseDto> VerificarTransaccionAsync(TerminalVerificarRequestDto request, CancellationToken ct = default);
+    Task<List<TerminalCajaDto>> ObtenerCajasAsync(int? sucursal, CancellationToken ct = default);
 }
