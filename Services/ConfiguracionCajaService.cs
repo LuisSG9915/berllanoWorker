@@ -266,7 +266,7 @@ public class ConfiguracionCajaService : IConfiguracionCajaService
             await using var rdRec = await cmdRec.ExecuteReaderAsync(ct);
             while (await rdRec.ReadAsync(ct))
             {
-                ipsPorCaja[(rdRec.GetInt16(0), rdRec.GetInt16(1))] = rdRec.GetString(2);
+                ipsPorCaja[(Convert.ToInt32(rdRec.GetValue(0)), Convert.ToInt32(rdRec.GetValue(1)))] = rdRec.GetString(2);
             }
         }
 

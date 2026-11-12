@@ -64,15 +64,48 @@ if ($Sucursal -gt 0 -or $Caja -gt 0) {
     $scJson = "," + ($partes -join ",")
 }
 
-function Probar([string]$nombre, [string]$endpoint, [string]$body, [int]$esperado) {
-    try {
-        $resp = Invoke-WebRequest -Method POST -Uri "$BaseUrl/api/terminal/$endpoint" `
-            -Headers $headers -Body $body -TimeoutSec 200 -SkipHttpErrorCheck
-        $code = [int]$resp.StatusCode
-        $detalle = $resp.Content
-    } catch {
-        $code = 0; $detalle = $_.Exception.Message
+# Compatible con Windows PowerShell 5.1 y PowerShell 7:
+# en 5.1 Invoke-WebRequest no tiene -SkipHttpErrorCheck y lanza WebException
+# con .Response (HttpWebResponse); en 7 lanza excepcion con .Response
+# (HttpResponseMessage). Send-Api normaliza ambos a @{ Code; Content }.
+function Send-Api {
+    param([string]$Method, [string]$Uri, [string]$Body, [int]$TimeoutSec)
+    $params = @{
+        Method          = $Method
+        Uri             = $Uri
+        Headers         = $headers
+        TimeoutSec      = $TimeoutSec
+        UseBasicParsing = $true
     }
+    if ($Body) { $params["Body"] = $Body }
+    try {
+        $resp = Invoke-WebRequest @params
+        return [pscustomobject]@{ Code = [int]$resp.StatusCode; Content = "$($resp.Content)" }
+    } catch {
+        $ex = $_.Exception
+        $code = 0
+        $content = $ex.Message
+        $r = $ex.Response
+        if ($null -ne $r) {
+            try { $code = [int]$r.StatusCode } catch { }
+            try {
+                if ($r -is [System.Net.HttpWebResponse]) {
+                    $sr = New-Object System.IO.StreamReader($r.GetResponseStream())
+                    $content = $sr.ReadToEnd()
+                    $sr.Close()
+                } elseif ($r.Content) {
+                    $content = $r.Content.ReadAsStringAsync().Result
+                }
+            } catch { }
+        }
+        return [pscustomobject]@{ Code = $code; Content = $content }
+    }
+}
+
+function Probar([string]$nombre, [string]$endpoint, [string]$body, [int]$esperado) {
+    $r = Send-Api -Method POST -Uri "$BaseUrl/api/terminal/$endpoint" -Body $body -TimeoutSec 200
+    $code = $r.Code
+    $detalle = $r.Content
     $ok = ($code -eq $esperado)
     if (-not $ok) { $script:fallas++ }
     $color = if ($ok) { "Green" } else { "Red" }
@@ -83,14 +116,9 @@ function Probar([string]$nombre, [string]$endpoint, [string]$body, [int]$esperad
 }
 
 function ProbarGet([string]$nombre, [string]$ruta, [int]$esperado) {
-    try {
-        $resp = Invoke-WebRequest -Method GET -Uri "$BaseUrl/$ruta" `
-            -Headers $headers -TimeoutSec 30 -SkipHttpErrorCheck
-        $code = [int]$resp.StatusCode
-        $detalle = $resp.Content
-    } catch {
-        $code = 0; $detalle = $_.Exception.Message
-    }
+    $r = Send-Api -Method GET -Uri "$BaseUrl/$ruta" -TimeoutSec 30
+    $code = $r.Code
+    $detalle = $r.Content
     $ok = ($code -eq $esperado)
     if (-not $ok) { $script:fallas++ }
     $color = if ($ok) { "Green" } else { "Red" }
@@ -101,14 +129,9 @@ function ProbarGet([string]$nombre, [string]$ruta, [int]$esperado) {
 }
 
 function ProbarPost([string]$nombre, [string]$ruta, [string]$body, [int]$esperado) {
-    try {
-        $resp = Invoke-WebRequest -Method POST -Uri "$BaseUrl/$ruta" `
-            -Headers $headers -Body $body -TimeoutSec 60 -SkipHttpErrorCheck
-        $code = [int]$resp.StatusCode
-        $detalle = $resp.Content
-    } catch {
-        $code = 0; $detalle = $_.Exception.Message
-    }
+    $r = Send-Api -Method POST -Uri "$BaseUrl/$ruta" -Body $body -TimeoutSec 60
+    $code = $r.Code
+    $detalle = $r.Content
     $ok = ($code -eq $esperado)
     if (-not $ok) { $script:fallas++ }
     $color = if ($ok) { "Green" } else { "Red" }
@@ -122,7 +145,8 @@ Write-Host "=== PREFLIGHT ===" -ForegroundColor Cyan
 $cfg = Get-Content "$InstallDir\appsettings.json" -Raw | ConvertFrom-Json
 $exe = $cfg.TerminalBanorte.RutaWorkerExe
 $ip = $cfg.TerminalBanorte.IpTerminal
-$puerto = [int]$cfg.TerminalBanorte.Puerto
+$puerto = [int]$cfg.TerminalBanorte.PuertoDefault
+if ($puerto -le 0) { $puerto = [int]$cfg.TerminalBanorte.Puerto }
 
 if (Test-Path $exe) {
     Write-Host "[OK  ] BanorteWorker.exe encontrado en $exe" -ForegroundColor Green
@@ -176,7 +200,9 @@ Probar "TCP inalcanzable -> 503"     "cobro"       $bodyIpMala                  
 Write-Host "`n=== CONCURRENCIA (semaforo pinpad) ===" -ForegroundColor Cyan
 $j1 = Start-Job -ScriptBlock {
     param($u, $h, $b)
-    Invoke-WebRequest -Method POST -Uri "$u/api/terminal/cobro" -Headers $h -Body $b -TimeoutSec 30 -SkipHttpErrorCheck
+    try {
+        Invoke-WebRequest -Method POST -Uri "$u/api/terminal/cobro" -Headers $h -Body $b -TimeoutSec 30 -UseBasicParsing | Out-Null
+    } catch { }
 } -ArgumentList $BaseUrl, $headers, $bodyIpMala
 Start-Sleep -Milliseconds 300
 Probar "segundo cobro concurrente -> 423" "cobro" $bodyIpMala 423
