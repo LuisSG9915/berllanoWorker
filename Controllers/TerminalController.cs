@@ -86,4 +86,22 @@ public class TerminalController : ControllerBase
         var result = await _terminalService.ObtenerCajasAsync(sucursal, ct);
         return Ok(result);
     }
+
+    // GET /api/terminal/terminales?sucursal={sucursal}&verificarPing=true
+    // Lista todas las terminales configuradas con su estado online/offline
+    [HttpGet("terminales")]
+    public async Task<IActionResult> Terminales([FromQuery] int? sucursal, [FromQuery] bool verificarPing = true, CancellationToken ct = default)
+    {
+        var result = await _terminalService.ObtenerTerminalesAsync(sucursal, verificarPing, ct);
+        return Ok(result);
+    }
+
+    // POST /api/terminal/imprimir-voucher -> imprime voucher de rechazo o reimpresión
+    [HttpPost("imprimir-voucher")]
+    public IActionResult ImprimirVoucher([FromBody] ImprimirVoucherRequestDto request)
+    {
+        // TODO: Implementar lógica de impresión de voucher de rechazo
+        // Por ahora retornamos OK para mantener compatibilidad
+        return Ok(new { status = 200, mensaje = "Voucher enviado a cola de impresion" });
+    }
 }

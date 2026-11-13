@@ -140,6 +140,7 @@ public static class EscPosBuilder
 
             case "CAJON":
             case "ABRE_CAJON":
+            case "ABRIR_CAJON":
                 ms.Write(PulsoCajon);
                 break;
 

@@ -8,6 +8,7 @@ using System.Text;
 using berllanoWorker.Exceptions;
 using berllanoWorker.Interfaces;
 using berllanoWorker.Models;
+using Microsoft.Data.SqlClient;
 
 namespace berllanoWorker.Services;
 
@@ -22,6 +23,7 @@ public class TerminalService : ITerminalService
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogger<TerminalService> _logger;
     private readonly IConfiguracionCajaService _configCaja;
+    private readonly IImpresionService _impresionService;
 
     private readonly string _rutaWorkerExe;
     private readonly string _rutaWrapperDll;
@@ -44,10 +46,11 @@ public class TerminalService : ITerminalService
     }
 
     public TerminalService(IConfiguration configuration, ILogger<TerminalService> logger,
-        IConfiguracionCajaService configCaja)
+        IConfiguracionCajaService configCaja, IImpresionService impresionService)
     {
         _logger = logger;
         _configCaja = configCaja;
+        _impresionService = impresionService;
         _rutaWorkerExe = configuration.GetValue<string>("TerminalBanorte:RutaWorkerExe")
             ?? @"C:\asesor\BanortePOS\BanorteWorker.exe";
         _rutaWrapperDll = configuration.GetValue<string>("TerminalBanorte:RutaWrapperDll")
@@ -77,18 +80,309 @@ public class TerminalService : ITerminalService
             monto: 0.00m, efectivo: 0.00m, ct);
     }
 
-    public async Task<TerminalTransaccionResponseDto> CobrarAsync(TerminalCobroRequestDto request, CancellationToken ct = default)
+    public async Task<TerminalCobroResumenResponseDto> CobrarAsync(TerminalCobroRequestDto request, CancellationToken ct = default)
     {
         ValidarMonto(request.Monto);
 
+        if (request.MontoRetiro < 0)
+            throw new HardwareValidationException("El monto de retiro no puede ser negativo.");
+
         var cfg = await ResolverConfiguracionTerminalAsync(request, ct);
         var ahora = DateTime.Now;
-        var dto = await EjecutarAsync(cfg, "VENTA",
-            numControl: ahora.ToString("ddHHmmss") + "B",
-            uuid: "UUID-" + ahora.ToString("yyyyMMddHHmmss"),
-            monto: request.Monto, efectivo: 0.00m, ct);
-        dto.ReferenciaCliente = request.Referencia;
-        return dto;
+
+        TerminalTransaccionResponseDto res;
+        if (request.MontoRetiro > 0)
+        {
+            // CASHBACK: cobro con retiro de efectivo
+            res = await EjecutarAsync(cfg, "CASHBACK",
+                numControl: ahora.ToString("ddHHmmss") + "C",
+                uuid: "UUID-" + ahora.ToString("yyyyMMddHHmmss") + "-C",
+                monto: request.Monto, efectivo: request.MontoRetiro, ct);
+        }
+        else
+        {
+            // VENTA normal
+            res = await EjecutarAsync(cfg, "VENTA",
+                numControl: ahora.ToString("ddHHmmss") + "B",
+                uuid: "UUID-" + ahora.ToString("yyyyMMddHHmmss"),
+                monto: request.Monto, efectivo: 0.00m, ct);
+        }
+
+        res.ReferenciaCliente = request.Referencia;
+
+        var resumen = new TerminalCobroResumenResponseDto
+        {
+            Aprobada = res.Aprobada,
+            Estado = res.Estado,
+            CodigoRespuesta = res.CodigoRespuesta,
+            MensajeRespuesta = res.MensajeRespuesta
+        };
+
+        // Bloque 1: Inserción en BD (sp_registra_pago_banorte2026)
+        if (request.NoVenta > 0)
+        {
+            try
+            {
+                var connString = _configCaja.ObtenerConnectionString();
+                if (!string.IsNullOrWhiteSpace(connString))
+                {
+                    // Calcular parámetros según especificación
+                    var tarjeta = "";
+                    if (res.Pan.Length >= 4)
+                    {
+                        var bin = !string.IsNullOrEmpty(res.Bin) ? res.Bin : "******";
+                        var base16 = (bin + "**********")[..Math.Min(12, (bin + "**********").Length)];
+                        tarjeta = base16 + res.Pan[^4..];
+                        if (tarjeta.Length > 16) tarjeta = tarjeta[..16];
+                    }
+
+                    var codigoTransaccion = res.NumControl;
+                    var importe = (double)request.Monto;
+                    var numAfiliacion = cfg.Afiliacion;
+                    var numeroSesion = "0";
+                    var codigoRespuesta = res.Aprobada ? "00" : res.CodigoRespuesta;
+                    var aplicada = res.Aprobada;
+                    var numAutorizacion = res.CodigoAutorizacion ?? "";
+                    var mensajeRespuesta = res.Aprobada ? "Aprobado" : 
+                        (string.IsNullOrWhiteSpace(res.MensajeRespuesta) ? "DECLINADA POR TERMINAL/BANCO" : res.MensajeRespuesta);
+                    var tipoTarjeta = (!string.IsNullOrWhiteSpace(res.EmvPrefName) ? res.EmvPrefName : res.TipoTarjeta);
+                    if (tipoTarjeta.Length > 20) tipoTarjeta = tipoTarjeta[..20];
+                    var nombreCliente = "";
+                    var idEncriptacion = "";
+                    var cancelada = false;
+                    var refFinanciera = string.IsNullOrWhiteSpace(res.ReferenciaPayworks) ? "00000000" : res.ReferenciaPayworks;
+                    var montoRetiro = request.MontoRetiro > 0 ? ((int)Math.Round(request.MontoRetiro)).ToString() : "0";
+                    var usuario = request.UsuarioPos;
+                    var corte = request.Corte;
+                    var corteParcial = request.CorteParcial;
+                    var efectivo = (double)request.Efectivo;
+                    var pagoCombinado = request.PagoCombinado ?? "";
+
+                    const string sql = """
+                        EXEC dbo.sp_registra_pago_banorte2026
+                            @sucursal, @no_venta, @caja, @tipo_pago, @tarjeta, @codigo_transaccion,
+                            @importe, @num_afiliacion, @numero_sesion, @codigo_respuesta, @aplicada,
+                            @num_autorizacion, @mensaje_respuesta, @tipo_tarjeta, @nombre_cliente,
+                            @id_encriptacion, @cancelada, @ref_financiera, @monto_retiro,
+                            @usuario, @corte, @corte_parcial, @efectivo, @pago_combinado
+                        """;
+
+                    await using var cn = new SqlConnection(connString);
+                    await cn.OpenAsync(ct);
+                    await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 30 };
+                    cmd.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+                    cmd.Parameters.AddWithValue("@no_venta", request.NoVenta);
+                    cmd.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+                    cmd.Parameters.AddWithValue("@tipo_pago", 7);
+                    cmd.Parameters.AddWithValue("@tarjeta", tarjeta);
+                    cmd.Parameters.AddWithValue("@codigo_transaccion", codigoTransaccion);
+                    cmd.Parameters.AddWithValue("@importe", importe);
+                    cmd.Parameters.AddWithValue("@num_afiliacion", numAfiliacion);
+                    cmd.Parameters.AddWithValue("@numero_sesion", numeroSesion);
+                    cmd.Parameters.AddWithValue("@codigo_respuesta", codigoRespuesta);
+                    cmd.Parameters.AddWithValue("@aplicada", aplicada);
+                    cmd.Parameters.AddWithValue("@num_autorizacion", numAutorizacion);
+                    cmd.Parameters.AddWithValue("@mensaje_respuesta", mensajeRespuesta);
+                    cmd.Parameters.AddWithValue("@tipo_tarjeta", tipoTarjeta);
+                    cmd.Parameters.AddWithValue("@nombre_cliente", nombreCliente);
+                    cmd.Parameters.AddWithValue("@id_encriptacion", idEncriptacion);
+                    cmd.Parameters.AddWithValue("@cancelada", cancelada);
+                    cmd.Parameters.AddWithValue("@ref_financiera", refFinanciera);
+                    cmd.Parameters.AddWithValue("@monto_retiro", montoRetiro);
+                    cmd.Parameters.AddWithValue("@usuario", usuario);
+                    cmd.Parameters.AddWithValue("@corte", corte);
+                    cmd.Parameters.AddWithValue("@corte_parcial", corteParcial);
+                    cmd.Parameters.AddWithValue("@efectivo", efectivo);
+                    cmd.Parameters.AddWithValue("@pago_combinado", pagoCombinado);
+
+                    await cmd.ExecuteNonQueryAsync(ct);
+
+                    // Obtener numero_secuencia insertado
+                    const string sqlSeq = """
+                        SELECT TOP 1 numero_secuencia
+                        FROM dbo.detalle_ventas_pagos WITH (NOLOCK)
+                        WHERE sucursal = @sucursal AND caja = @caja AND no_venta = @no_venta AND codigo_transaccion = @codigo_transaccion
+                        ORDER BY numero_secuencia DESC;
+                        """;
+
+                    await using var cmdSeq = new SqlCommand(sqlSeq, cn) { CommandTimeout = 10 };
+                    cmdSeq.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+                    cmdSeq.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+                    cmdSeq.Parameters.AddWithValue("@no_venta", request.NoVenta);
+                    cmdSeq.Parameters.AddWithValue("@codigo_transaccion", codigoTransaccion);
+
+                    var seqResult = await cmdSeq.ExecuteScalarAsync(ct);
+                    if (seqResult != null && seqResult != DBNull.Value)
+                    {
+                        res.NumeroSecuencia = Convert.ToInt64(seqResult);
+                        resumen.VentaInsertada = true;
+                        resumen.MensajeInsercion = $"Pago registrado en cberp (Secuencia: {res.NumeroSecuencia})";
+                    }
+                    else
+                    {
+                        resumen.VentaInsertada = false;
+                        resumen.MensajeInsercion = "No se pudo obtener numero_secuencia";
+                    }
+                }
+                else
+                {
+                    resumen.VentaInsertada = false;
+                    resumen.MensajeInsercion = "Connection string no configurado";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Error registrando pago en sp_registra_pago_banorte2026: {Msg}", ex.Message);
+                resumen.VentaInsertada = false;
+                resumen.MensajeInsercion = $"Error SQL: {ex.Message}";
+            }
+        }
+        else
+        {
+            resumen.VentaInsertada = false;
+            resumen.MensajeInsercion = "Omitido (no_venta no especificado)";
+        }
+
+        // Bloque 2: Impresión del Voucher (sp_ticket_banorte)
+        if (request.ImprimirVoucher && request.NoVenta > 0 && resumen.VentaInsertada)
+        {
+            try
+            {
+                var connString = _configCaja.ObtenerConnectionString();
+                if (!string.IsNullOrWhiteSpace(connString))
+                {
+                    // Preparar parámetros para sp_ticket_banorte
+                    var folio = (int)request.NoVenta;
+                    var caja = cfg.Caja;
+                    var suc = cfg.Sucursal;
+                    var autorizacion = res.CodigoAutorizacion;
+                    var secuencia = res.NumeroSecuencia ?? 0;
+                    var referenciaTransaccion = res.ReferenciaPayworks;
+                    var tipoPago = 7;
+                    var numTerminal = cfg.Afiliacion;
+                    var total = (double)request.Monto;
+                    var expiracionTarjeta = res.FechaExpiracion.Length == 4 ? 
+                        res.FechaExpiracion[..2] + "/" + res.FechaExpiracion[2..] : res.FechaExpiracion;
+                    var tipoTarjetaV = !string.IsNullOrWhiteSpace(res.MarcaTarjeta) ? res.MarcaTarjeta : "VISA";
+                    var bancoPlastico = !string.IsNullOrWhiteSpace(res.BancoEmisor) ? res.BancoEmisor : "BANORTE";
+                    var american = res.ModoEntrada;
+                    var tipoTrans = request.MontoRetiro > 0 ? "Venta con Cashback" : "Venta";
+                    var numControl = res.NumControl;
+                    var estadoAutorizacion = res.Aprobada ? "APROBADA" : "DECLINADA";
+                    var referenciaOriginal = "";
+                    var tipoTarj = (res.EmvPrefName.Contains("DEB", StringComparison.OrdinalIgnoreCase) || 
+                                   res.TipoTarjeta.Contains("DEB", StringComparison.OrdinalIgnoreCase)) ? "D" : "C";
+                    var pin = res.UsoPin == "1";
+                    var fechaTran = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+                    var tarjetaReferida = res.Pan.Length >= 2 ? res.Pan[^2..] : "";
+
+                    // Construir tags_EMV
+                    var aidPadded = (res.EmvAid ?? "").PadRight(14, ' ');
+                    var tvrPadded = (res.EmvTvr ?? "").PadRight(10, ' ');
+                    var tagsEmv = $"4F07{aidPadded}9505{tvrPadded}";
+
+                    const string sql = """
+                        EXEC dbo.sp_ticket_banorte
+                            @folio, @caja, @suc, @autorizacion, @secuencia, @referencia_transaccion,
+                            @tipo_pago, @num_terminal, @total, @expiracion_tarjeta, @tipo_tarjeta_v,
+                            @banco_plastico, @american, @tipo_trans, @num_control, @estado_autorizacion,
+                            @referencia_original, @tipo_tarj, @pin, @fecha_tran, @tarjeta_referida, @tags_EMV
+                        """;
+
+                    var lineas = new List<VoucherLineaDto>();
+                    await using var cn = new SqlConnection(connString);
+                    await cn.OpenAsync(ct);
+                    await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 30 };
+                    cmd.Parameters.AddWithValue("@folio", folio);
+                    cmd.Parameters.AddWithValue("@caja", caja);
+                    cmd.Parameters.AddWithValue("@suc", suc);
+                    cmd.Parameters.AddWithValue("@autorizacion", autorizacion);
+                    cmd.Parameters.AddWithValue("@secuencia", secuencia);
+                    cmd.Parameters.AddWithValue("@referencia_transaccion", referenciaTransaccion);
+                    cmd.Parameters.AddWithValue("@tipo_pago", tipoPago);
+                    cmd.Parameters.AddWithValue("@num_terminal", numTerminal);
+                    cmd.Parameters.AddWithValue("@total", total);
+                    cmd.Parameters.AddWithValue("@expiracion_tarjeta", expiracionTarjeta);
+                    cmd.Parameters.AddWithValue("@tipo_tarjeta_v", tipoTarjetaV);
+                    cmd.Parameters.AddWithValue("@banco_plastico", bancoPlastico);
+                    cmd.Parameters.AddWithValue("@american", american);
+                    cmd.Parameters.AddWithValue("@tipo_trans", tipoTrans);
+                    cmd.Parameters.AddWithValue("@num_control", numControl);
+                    cmd.Parameters.AddWithValue("@estado_autorizacion", estadoAutorizacion);
+                    cmd.Parameters.AddWithValue("@referencia_original", referenciaOriginal);
+                    cmd.Parameters.AddWithValue("@tipo_tarj", tipoTarj);
+                    cmd.Parameters.AddWithValue("@pin", pin);
+                    cmd.Parameters.AddWithValue("@fecha_tran", fechaTran);
+                    cmd.Parameters.AddWithValue("@tarjeta_referida", tarjetaReferida);
+                    cmd.Parameters.AddWithValue("@tags_EMV", tagsEmv);
+
+                    await using var rd = await cmd.ExecuteReaderAsync(ct);
+                    while (await rd.ReadAsync(ct))
+                    {
+                        var cons = rd.GetDouble(0);
+                        var tipo = rd.GetString(1);
+                        var linea = rd.GetString(2);
+                        lineas.Add(new VoucherLineaDto { Cons = cons, Tipo = tipo, Linea = linea });
+                    }
+
+                    // Ordenar por CONS ASC
+                    lineas = lineas.OrderBy(l => l.Cons).ToList();
+                    res.VoucherLineas = lineas;
+
+                    // Imprimir voucher
+                    var ticketLineas = new List<TicketLineaDto>();
+                    foreach (var linea in lineas)
+                    {
+                        var consecutivo = (decimal)linea.Cons;
+                        if (linea.Cons == 99)
+                        {
+                            // Corte de papel
+                            ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "CORTE_PAPEL", Data = "" });
+                        }
+                        else if (linea.Cons == 100 && !string.IsNullOrEmpty(linea.Linea))
+                        {
+                            // Pulso de cajón
+                            ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "ABRIR_CAJON", Data = "" });
+                        }
+                        else if (linea.Cons < 99)
+                        {
+                            // Texto plano
+                            ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "TEXTO_PLANO", Data = linea.Linea });
+                        }
+                    }
+
+                    var ticketRequest = new TicketRequestDto
+                    {
+                        Recurso = "Tickets",
+                        Sucursal = cfg.Sucursal,
+                        Caja = cfg.Caja,
+                        TicketDataset = ticketLineas
+                    };
+
+                    await _impresionService.ImprimirTicketAsync(ticketRequest);
+                    resumen.TicketImpreso = true;
+                    resumen.MensajeTicket = "Voucher enviado a impresora";
+                }
+                else
+                {
+                    resumen.TicketImpreso = false;
+                    resumen.MensajeTicket = "Connection string no configurado";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Error generando/imprimiendo voucher: {Msg}", ex.Message);
+                resumen.TicketImpreso = false;
+                resumen.MensajeTicket = $"Error al imprimir voucher: {ex.Message}";
+            }
+        }
+        else
+        {
+            resumen.TicketImpreso = false;
+            resumen.MensajeTicket = "Omitido (no_venta no especificado o venta no insertada)";
+        }
+
+        return resumen;
     }
 
     public async Task<TerminalTransaccionResponseDto> RetirarEfectivoAsync(TerminalRetiroRequestDto request, CancellationToken ct = default)
@@ -129,8 +423,16 @@ public class TerminalService : ITerminalService
         if (EsReferenciaPayworks(id) && request.Monto.GetValueOrDefault() > 0)
         {
             ValidarMonto(request.Monto!.Value);
-            return await ConBloqueoAsync(cfg,
+            var dto = await ConBloqueoAsync(cfg,
                 token => EjecutarDevolucionWrapperAsync(cfg, id, request.Monto.Value, token), ct);
+
+            // Reversas en BD si está aprobado y hay no_venta
+            if (dto.Aprobada && request.NoVenta.HasValue && request.NoVenta.Value > 0)
+            {
+                await EjecutarReversasBDAsync(request, cfg, id, ct);
+            }
+
+            return dto;
         }
 
         // Caso general: reset de sesion EMV (CANCELAR / PPSendTxn(3)).
@@ -138,6 +440,58 @@ public class TerminalService : ITerminalService
             numControl: id,
             uuid: "UUID-CAN-" + DateTime.Now.ToString("yyyyMMddHHmmss"),
             monto: 0.00m, efectivo: 0.00m, ct);
+    }
+
+    // Ejecutar reversas en BD después de cancelación/devolución exitosa
+    private async Task EjecutarReversasBDAsync(TerminalCancelacionRequestDto request, ConfigEfectiva cfg, string referenciaPayworks, CancellationToken ct)
+    {
+        try
+        {
+            var connString = _configCaja.ObtenerConnectionString();
+            if (string.IsNullOrWhiteSpace(connString)) return;
+
+            await using var cn = new SqlConnection(connString);
+            await cn.OpenAsync(ct);
+
+            // 1. Marcar pago como cancelado en detalle_ventas_pagos
+            const string sql1 = """
+                UPDATE dbo.detalle_ventas_pagos
+                SET aplicada = 0, cancelada = 1, leyenda_respuesta = 'Cancelada'
+                WHERE ref_financiera = @ref AND sucursal = @sucursal AND caja = @caja AND no_venta = @no_venta;
+                """;
+
+            await using (var cmd1 = new SqlCommand(sql1, cn) { CommandTimeout = 30 })
+            {
+                cmd1.Parameters.AddWithValue("@ref", referenciaPayworks);
+                cmd1.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+                cmd1.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+                cmd1.Parameters.AddWithValue("@no_venta", request.NoVenta!.Value);
+                await cmd1.ExecuteNonQueryAsync(ct);
+            }
+
+            // 2. Si reversa_venta == true, reversar la venta completa
+            if (request.ReversaVenta)
+            {
+                const string sql2 = """
+                    UPDATE dbo.detalle_ventas SET observacion = 'Cancelacion TC', cant_producto = 0
+                    WHERE sucursal = @sucursal AND caja = @caja AND no_venta = @no_venta;
+
+                    UPDATE dbo.detalle_ventas_medios_pagos SET referencia = referencia + '-Cancelacion TC', importe = 0
+                    WHERE sucursal = @sucursal AND caja = @caja AND folio_venta = @no_venta;
+                    """;
+
+                await using var cmd2 = new SqlCommand(sql2, cn) { CommandTimeout = 30 };
+                cmd2.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+                cmd2.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+                cmd2.Parameters.AddWithValue("@no_venta", request.NoVenta!.Value);
+                await cmd2.ExecuteNonQueryAsync(ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error ejecutando reversas en BD: {Msg}", ex.Message);
+            // No lanzar excepción para no afectar la cancelación principal
+        }
     }
 
     private static bool EsReferenciaPayworks(string id)
@@ -166,6 +520,10 @@ public class TerminalService : ITerminalService
     // GET /api/terminal/cajas: delega al servicio central (sin pass_banorte).
     public Task<List<TerminalCajaDto>> ObtenerCajasAsync(int? sucursal, CancellationToken ct = default)
         => _configCaja.ObtenerCajasTerminalAsync(sucursal, ct);
+
+    // GET /api/terminal/terminales: lista de terminales con estado online
+    public Task<List<TerminalInfoDto>> ObtenerTerminalesAsync(int? sucursal, bool verificarPing, CancellationToken ct = default)
+        => _configCaja.ObtenerTerminalesConEstadoAsync(sucursal, verificarPing, ct);
 
     private Task<TerminalTransaccionResponseDto> EjecutarAsync(
         ConfigEfectiva cfg, string operacion, string numControl, string uuid,
@@ -320,9 +678,24 @@ public class TerminalService : ITerminalService
         }
         catch (SocketException ex)
         {
+            string mensajeDetalle = ex.SocketErrorCode switch
+            {
+                SocketError.ConnectionRefused =>
+                    "La terminal está encendida pero no está en la aplicación del banco. " +
+                    "Por favor, abre la aplicación Banorte en la terminal y vuelve a intentar.",
+                SocketError.TimedOut =>
+                    "La terminal no responde. Verifica que esté encendida y en la misma red.",
+                SocketError.HostUnreachable =>
+                    "No se puede alcanzar la terminal. Verifica que esté encendida y en la misma red.",
+                SocketError.NetworkUnreachable =>
+                    "No hay conexión de red hacia la terminal. Verifica la configuración de red.",
+                _ =>
+                    $"Error de conexión con la terminal: {ex.SocketErrorCode}. " +
+                    "Verifica que esté encendida y en la misma red."
+            };
+
             throw new HardwareDisconnectedException(
-                $"Sin conexion TCP con la terminal {ip}:{puerto}: {ex.SocketErrorCode}. " +
-                "Verifica que este encendida y en la misma red.");
+                $"Sin conexion TCP con la terminal {ip}:{puerto}: {mensajeDetalle}");
         }
     }
 
@@ -526,4 +899,254 @@ public class TerminalService : ITerminalService
 
     private static string Campo(string[] campos, int i)
         => i < campos.Length ? campos[i].Trim() : string.Empty;
+
+    // FASE 2: Registrar pago en sp_registra_pago_banorte2026
+    private async Task RegistrarPagoBanorteAsync(TerminalTransaccionResponseDto res, TerminalCobroRequestDto request, ConfigEfectiva cfg, CancellationToken ct)
+    {
+        try
+        {
+            var connString = _configCaja.ObtenerConnectionString();
+            if (string.IsNullOrWhiteSpace(connString)) return;
+
+            // Calcular parámetros según especificación
+            var tarjeta = "";
+            if (res.Pan.Length >= 4)
+            {
+                var bin = !string.IsNullOrEmpty(res.Bin) ? res.Bin : "******";
+                var base16 = (bin + "**********")[..Math.Min(12, (bin + "**********").Length)];
+                tarjeta = base16 + res.Pan[^4..];
+                if (tarjeta.Length > 16) tarjeta = tarjeta[..16];
+            }
+
+            var codigoTransaccion = res.NumControl;
+            var importe = (double)request.Monto;
+            var numAfiliacion = cfg.Afiliacion;
+            var numeroSesion = "0";
+            var codigoRespuesta = res.Aprobada ? "00" : res.CodigoRespuesta;
+            var aplicada = res.Aprobada;
+            var numAutorizacion = res.CodigoAutorizacion ?? "";
+            var mensajeRespuesta = res.Aprobada ? "Aprobado" : 
+                (string.IsNullOrWhiteSpace(res.MensajeRespuesta) ? "DECLINADA POR TERMINAL/BANCO" : res.MensajeRespuesta);
+            var tipoTarjeta = (!string.IsNullOrWhiteSpace(res.EmvPrefName) ? res.EmvPrefName : res.TipoTarjeta);
+            if (tipoTarjeta.Length > 20) tipoTarjeta = tipoTarjeta[..20];
+            var nombreCliente = "";
+            var idEncriptacion = "";
+            var cancelada = false;
+            var refFinanciera = string.IsNullOrWhiteSpace(res.ReferenciaPayworks) ? "00000000" : res.ReferenciaPayworks;
+            var montoRetiro = request.MontoRetiro > 0 ? ((int)Math.Round(request.MontoRetiro)).ToString() : "0";
+            var usuario = request.UsuarioPos;
+            var corte = request.Corte;
+            var corteParcial = request.CorteParcial;
+            var efectivo = (double)request.Efectivo;
+            var pagoCombinado = request.PagoCombinado ?? "";
+
+            const string sql = """
+                EXEC dbo.sp_registra_pago_banorte2026
+                    @sucursal, @no_venta, @caja, @tipo_pago, @tarjeta, @codigo_transaccion,
+                    @importe, @num_afiliacion, @numero_sesion, @codigo_respuesta, @aplicada,
+                    @num_autorizacion, @mensaje_respuesta, @tipo_tarjeta, @nombre_cliente,
+                    @id_encriptacion, @cancelada, @ref_financiera, @monto_retiro,
+                    @usuario, @corte, @corte_parcial, @efectivo, @pago_combinado
+                """;
+
+            await using var cn = new SqlConnection(connString);
+            await cn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 30 };
+            cmd.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+            cmd.Parameters.AddWithValue("@no_venta", request.NoVenta);
+            cmd.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+            cmd.Parameters.AddWithValue("@tipo_pago", 7);
+            cmd.Parameters.AddWithValue("@tarjeta", tarjeta);
+            cmd.Parameters.AddWithValue("@codigo_transaccion", codigoTransaccion);
+            cmd.Parameters.AddWithValue("@importe", importe);
+            cmd.Parameters.AddWithValue("@num_afiliacion", numAfiliacion);
+            cmd.Parameters.AddWithValue("@numero_sesion", numeroSesion);
+            cmd.Parameters.AddWithValue("@codigo_respuesta", codigoRespuesta);
+            cmd.Parameters.AddWithValue("@aplicada", aplicada);
+            cmd.Parameters.AddWithValue("@num_autorizacion", numAutorizacion);
+            cmd.Parameters.AddWithValue("@mensaje_respuesta", mensajeRespuesta);
+            cmd.Parameters.AddWithValue("@tipo_tarjeta", tipoTarjeta);
+            cmd.Parameters.AddWithValue("@nombre_cliente", nombreCliente);
+            cmd.Parameters.AddWithValue("@id_encriptacion", idEncriptacion);
+            cmd.Parameters.AddWithValue("@cancelada", cancelada);
+            cmd.Parameters.AddWithValue("@ref_financiera", refFinanciera);
+            cmd.Parameters.AddWithValue("@monto_retiro", montoRetiro);
+            cmd.Parameters.AddWithValue("@usuario", usuario);
+            cmd.Parameters.AddWithValue("@corte", corte);
+            cmd.Parameters.AddWithValue("@corte_parcial", corteParcial);
+            cmd.Parameters.AddWithValue("@efectivo", efectivo);
+            cmd.Parameters.AddWithValue("@pago_combinado", pagoCombinado);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+
+            // Obtener numero_secuencia insertado
+            const string sqlSeq = """
+                SELECT TOP 1 numero_secuencia
+                FROM dbo.detalle_ventas_pagos WITH (NOLOCK)
+                WHERE sucursal = @sucursal AND caja = @caja AND no_venta = @no_venta AND codigo_transaccion = @codigo_transaccion
+                ORDER BY numero_secuencia DESC;
+                """;
+
+            await using var cmdSeq = new SqlCommand(sqlSeq, cn) { CommandTimeout = 10 };
+            cmdSeq.Parameters.AddWithValue("@sucursal", (short)cfg.Sucursal);
+            cmdSeq.Parameters.AddWithValue("@caja", (short)cfg.Caja);
+            cmdSeq.Parameters.AddWithValue("@no_venta", request.NoVenta);
+            cmdSeq.Parameters.AddWithValue("@codigo_transaccion", codigoTransaccion);
+
+            var seqResult = await cmdSeq.ExecuteScalarAsync(ct);
+            if (seqResult != null && seqResult != DBNull.Value)
+            {
+                res.NumeroSecuencia = Convert.ToInt64(seqResult);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error registrando pago en sp_registra_pago_banorte2026: {Msg}", ex.Message);
+            // No lanzar excepción para no afectar la transacción principal
+        }
+    }
+
+    // FASE 3: Generar e imprimir voucher usando sp_ticket_banorte
+    private async Task GenerarEImprimirVoucherAsync(TerminalTransaccionResponseDto res, TerminalCobroRequestDto request, ConfigEfectiva cfg, CancellationToken ct)
+    {
+        try
+        {
+            var connString = _configCaja.ObtenerConnectionString();
+            if (string.IsNullOrWhiteSpace(connString)) return;
+
+            // Preparar parámetros para sp_ticket_banorte
+            var folio = (int)request.NoVenta;
+            var caja = cfg.Caja;
+            var suc = cfg.Sucursal;
+            var autorizacion = res.CodigoAutorizacion;
+            var secuencia = res.NumeroSecuencia ?? 0;
+            var referenciaTransaccion = res.ReferenciaPayworks;
+            var tipoPago = 7;
+            var numTerminal = cfg.Afiliacion;
+            var total = (double)request.Monto;
+            var expiracionTarjeta = res.FechaExpiracion.Length == 4 ? 
+                res.FechaExpiracion[..2] + "/" + res.FechaExpiracion[2..] : res.FechaExpiracion;
+            var tipoTarjetaV = !string.IsNullOrWhiteSpace(res.MarcaTarjeta) ? res.MarcaTarjeta : "VISA";
+            var bancoPlastico = !string.IsNullOrWhiteSpace(res.BancoEmisor) ? res.BancoEmisor : "BANORTE";
+            var american = res.ModoEntrada;
+            var tipoTrans = request.MontoRetiro > 0 ? "Venta con Cashback" : "Venta";
+            var numControl = res.NumControl;
+            var estadoAutorizacion = res.Aprobada ? "APROBADA" : "DECLINADA";
+            var referenciaOriginal = "";
+            var tipoTarj = (res.EmvPrefName.Contains("DEB", StringComparison.OrdinalIgnoreCase) || 
+                           res.TipoTarjeta.Contains("DEB", StringComparison.OrdinalIgnoreCase)) ? "D" : "C";
+            var pin = res.UsoPin == "1";
+            var fechaTran = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+            var tarjetaReferida = res.Pan.Length >= 2 ? res.Pan[^2..] : "";
+
+            // Construir tags_EMV
+            var aidPadded = (res.EmvAid ?? "").PadRight(14, ' ');
+            var tvrPadded = (res.EmvTvr ?? "").PadRight(10, ' ');
+            var tagsEmv = $"4F07{aidPadded}9505{tvrPadded}";
+
+            const string sql = """
+                EXEC dbo.sp_ticket_banorte
+                    @folio, @caja, @suc, @autorizacion, @secuencia, @referencia_transaccion,
+                    @tipo_pago, @num_terminal, @total, @expiracion_tarjeta, @tipo_tarjeta_v,
+                    @banco_plastico, @american, @tipo_trans, @num_control, @estado_autorizacion,
+                    @referencia_original, @tipo_tarj, @pin, @fecha_tran, @tarjeta_referida, @tags_EMV
+                """;
+
+            var lineas = new List<VoucherLineaDto>();
+            await using var cn = new SqlConnection(connString);
+            await cn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 30 };
+            cmd.Parameters.AddWithValue("@folio", folio);
+            cmd.Parameters.AddWithValue("@caja", caja);
+            cmd.Parameters.AddWithValue("@suc", suc);
+            cmd.Parameters.AddWithValue("@autorizacion", autorizacion);
+            cmd.Parameters.AddWithValue("@secuencia", secuencia);
+            cmd.Parameters.AddWithValue("@referencia_transaccion", referenciaTransaccion);
+            cmd.Parameters.AddWithValue("@tipo_pago", tipoPago);
+            cmd.Parameters.AddWithValue("@num_terminal", numTerminal);
+            cmd.Parameters.AddWithValue("@total", total);
+            cmd.Parameters.AddWithValue("@expiracion_tarjeta", expiracionTarjeta);
+            cmd.Parameters.AddWithValue("@tipo_tarjeta_v", tipoTarjetaV);
+            cmd.Parameters.AddWithValue("@banco_plastico", bancoPlastico);
+            cmd.Parameters.AddWithValue("@american", american);
+            cmd.Parameters.AddWithValue("@tipo_trans", tipoTrans);
+            cmd.Parameters.AddWithValue("@num_control", numControl);
+            cmd.Parameters.AddWithValue("@estado_autorizacion", estadoAutorizacion);
+            cmd.Parameters.AddWithValue("@referencia_original", referenciaOriginal);
+            cmd.Parameters.AddWithValue("@tipo_tarj", tipoTarj);
+            cmd.Parameters.AddWithValue("@pin", pin);
+            cmd.Parameters.AddWithValue("@fecha_tran", fechaTran);
+            cmd.Parameters.AddWithValue("@tarjeta_referida", tarjetaReferida);
+            cmd.Parameters.AddWithValue("@tags_EMV", tagsEmv);
+
+            await using var rd = await cmd.ExecuteReaderAsync(ct);
+            while (await rd.ReadAsync(ct))
+            {
+                var cons = rd.GetDouble(0);
+                var tipo = rd.GetString(1);
+                var linea = rd.GetString(2);
+                lineas.Add(new VoucherLineaDto { Cons = cons, Tipo = tipo, Linea = linea });
+            }
+
+            // Ordenar por CONS ASC
+            lineas = lineas.OrderBy(l => l.Cons).ToList();
+            res.VoucherLineas = lineas;
+
+            // Imprimir voucher si está habilitado
+            if (request.ImprimirVoucher && res.Aprobada)
+            {
+                await ImprimirVoucherAsync(lineas, cfg, ct);
+                res.VoucherImpreso = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error generando/imprimiendo voucher: {Msg}", ex.Message);
+            res.ErrorImpresion = ex.Message;
+            res.VoucherImpreso = false;
+        }
+    }
+
+    // Imprimir voucher usando IImpresionService
+    private async Task ImprimirVoucherAsync(List<VoucherLineaDto> lineas, ConfigEfectiva cfg, CancellationToken ct)
+    {
+        try
+        {
+            var ticketLineas = new List<TicketLineaDto>();
+            foreach (var linea in lineas)
+            {
+                var consecutivo = (decimal)linea.Cons;
+                if (linea.Cons == 99)
+                {
+                    // Corte de papel
+                    ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "CORTE_PAPEL", Data = "" });
+                }
+                else if (linea.Cons == 100 && !string.IsNullOrEmpty(linea.Linea))
+                {
+                    // Pulso de cajón - se maneja como modo especial
+                    ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "ABRIR_CAJON", Data = linea.Linea });
+                }
+                else if (linea.Cons < 99)
+                {
+                    // Texto plano
+                    ticketLineas.Add(new TicketLineaDto { Consecutivo = consecutivo, Modo = "TEXTO_PLANO", Data = linea.Linea });
+                }
+            }
+
+            var ticketRequest = new TicketRequestDto
+            {
+                Recurso = "Tickets",
+                Sucursal = cfg.Sucursal,
+                Caja = cfg.Caja,
+                TicketDataset = ticketLineas
+            };
+
+            await _impresionService.ImprimirTicketAsync(ticketRequest);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Error imprimiendo voucher: {Msg}", ex.Message);
+            throw;
+        }
+    }
 }

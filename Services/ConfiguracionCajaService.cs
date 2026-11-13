@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Drawing.Printing;
 using System.Globalization;
+using System.Net.Sockets;
 using System.Text.Json;
 using berllanoWorker.Exceptions;
 using berllanoWorker.Interfaces;
@@ -216,6 +217,104 @@ public class ConfiguracionCajaService : IConfiguracionCajaService
     // -----------------------------------------------------------------
     // Listados (sin pass_banorte)
     // -----------------------------------------------------------------
+    public async Task<List<TerminalInfoDto>> ObtenerTerminalesConEstadoAsync(int? sucursal, bool verificarPing, CancellationToken ct = default)
+    {
+        var lista = new List<TerminalInfoDto>();
+        if (string.IsNullOrWhiteSpace(_connString)) return lista;
+
+        var sql = """
+            SELECT cia, sucursal, caja,
+                LTRIM(RTRIM(ISNULL(id_terminal, '')))   AS id_terminal,
+                LTRIM(RTRIM(ISNULL(id_afiliacion, ''))) AS id_afiliacion,
+                LTRIM(RTRIM(ISNULL(usr_banorte, '')))   AS usr_banorte,
+                LTRIM(RTRIM(ISNULL(puerto, '1818')))    AS puerto,
+                LTRIM(RTRIM(ISNULL(modo, 'AUT')))       AS modo
+            FROM dbo.t_banorte_usuarios WITH (NOLOCK)
+            WHERE cia = @emp
+            """ + (sucursal.HasValue ? " AND sucursal = @suc" : "") +
+            " ORDER BY sucursal, caja;";
+
+        await using var cn = await AbrirConexionAsync(ct);
+        await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 10 };
+        cmd.Parameters.AddWithValue("@emp", _idEmpresa);
+        if (sucursal.HasValue) cmd.Parameters.AddWithValue("@suc", sucursal.Value);
+
+        var terminales = new List<(int Sucursal, int Caja, string IpTerminal, string Puerto, string Afiliacion, string Usuario, string Modo)>();
+        await using (var rd = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await rd.ReadAsync(ct))
+            {
+                terminales.Add((
+                    rd.GetInt16(1), rd.GetInt16(2),
+                    rd.GetString(3), rd.GetString(6), rd.GetString(4), rd.GetString(5), rd.GetString(7)
+                ));
+            }
+        }
+
+        // Obtener IPs de cat_RecursosWorker para cada terminal
+        var sqlRecursos = """
+            SELECT IdSucursal, Caja, LTRIM(RTRIM(NombreDispositivoLocal)) AS ip
+            FROM dbo.cat_RecursosWorker WITH (NOLOCK)
+            WHERE IdEmpresa = @emp AND Recurso = 'TerminalBanorte' AND Activo = 1
+            """ + (sucursal.HasValue ? " AND IdSucursal = @suc" : "") + ";";
+
+        var ipsPorCaja = new Dictionary<(int, int), string>();
+        await using (var cmdRec = new SqlCommand(sqlRecursos, cn) { CommandTimeout = 10 })
+        {
+            cmdRec.Parameters.AddWithValue("@emp", _idEmpresa);
+            if (sucursal.HasValue) cmdRec.Parameters.AddWithValue("@suc", sucursal.Value);
+            await using var rdRec = await cmdRec.ExecuteReaderAsync(ct);
+            while (await rdRec.ReadAsync(ct))
+            {
+                ipsPorCaja[(rdRec.GetInt16(0), rdRec.GetInt16(1))] = rdRec.GetString(2);
+            }
+        }
+
+        // Verificar ping TCP en paralelo si se solicita
+        var tareas = new List<Task<TerminalInfoDto>>();
+        foreach (var t in terminales)
+        {
+            var ip = ipsPorCaja.GetValueOrDefault((t.Sucursal, t.Caja), _ipTerminalLocal);
+            var puerto = int.TryParse(t.Puerto, out var p) ? p : 1818;
+
+            tareas.Add(Task.Run(async () =>
+            {
+                var online = false;
+                if (verificarPing && !string.IsNullOrWhiteSpace(ip))
+                {
+                    try
+                    {
+                        using var tcp = new TcpClient();
+                        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(800));
+                        await tcp.ConnectAsync(ip, puerto, timeoutCts.Token);
+                        online = true;
+                    }
+                    catch
+                    {
+                        online = false;
+                    }
+                }
+
+                return new TerminalInfoDto
+                {
+                    Sucursal = t.Sucursal,
+                    Caja = t.Caja,
+                    IpTerminal = ip,
+                    Puerto = t.Puerto,
+                    Afiliacion = t.Afiliacion,
+                    Usuario = t.Usuario,
+                    Modo = t.Modo,
+                    Online = online
+                };
+            }, ct));
+        }
+
+        var resultados = await Task.WhenAll(tareas);
+        lista.AddRange(resultados);
+        return lista;
+    }
+
     public async Task<List<TerminalCajaDto>> ObtenerCajasTerminalAsync(int? sucursal, CancellationToken ct = default)
     {
         var lista = new List<TerminalCajaDto>();
@@ -386,4 +485,6 @@ public class ConfiguracionCajaService : IConfiguracionCajaService
         if (!string.IsNullOrWhiteSpace(segundo)) return segundo.Trim();
         return fallback;
     }
+
+    public string ObtenerConnectionString() => _connString;
 }
