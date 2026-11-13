@@ -48,6 +48,42 @@ Reglas para saber **a qué pinpad y con qué credenciales** pega una petición:
    `cat_RecursosWorker` (`NombreDispositivoLocal` = IP); si no hay fila,
    cae al `TerminalBanorte:IpTerminal` del appsettings.
 
+### Mismo worker, varias cajas (misma sucursal)
+
+`cat_RecursosWorker` tiene índice único `(IdEmpresa, IdSucursal, Equipo,
+Recurso)`. Ojo con los roles de cada columna:
+
+| Columna | Quién la usa | Para qué |
+|---|---|---|
+| `Equipo` | PWA | Etiqueta del **slot** de caja ('PC-PRUEBAS', 'PC-PRUEBAS-C2'). Es llave única por recurso — **no puede repetirse** aunque sea la misma PC física. NO es el hostname. |
+| `IpWorker`/`HostWorker`/`Puerto` | PWA | **A qué PC mandar la petición** (IP y fallback mDNS). El worker las ignora. |
+| `Caja` | Worker | Caja lógica con la que resuelve recursos y credenciales. |
+| `NombreDispositivoLocal` | Worker | Impresora Windows / IP del pinpad **válidos en la PC que atiende la petición**. |
+
+Una sola PC atiende N cajas así (ejemplo real, sucursal 97):
+
+```text
+Caja 1: Equipo='PC-PRUEBAS'    IpWorker=192.168.100.54  Tickets='prueba'   Pinpad=192.168.100.81
+Caja 2: Equipo='PC-PRUEBAS-C2' IpWorker=192.168.100.54  Tickets='generic'  Pinpad=192.168.100.81
+```
+
+- El PWA elige `Equipo` (modal de selección) y manda al `IpWorker` de ese
+  equipo; al ser la misma IP, ambas cajas llegan al mismo `:5000`.
+- El worker resuelve por `caja` del body/header: caja 1 imprime en `prueba`,
+  caja 2 en `generic` — verificado en logs (`Ticket enviado a 'generic'` /
+  `'prueba'`).
+- **Pinpad compartida** (misma IP en varias cajas): el semáforo es por IP,
+  así que dos cobros simultáneos a la misma pinpad se serializan (el segundo
+  espera o da 423). Con pinpads distintas corren en paralelo.
+- **Trampa en la auto-detección del PWA**: si el PWA corre en esta PC,
+  `useWorkerStore` toma el **primer equipo** cuyo `IpWorker` matchee la IP
+  local (orden alfabético: 'PC-PRUEBAS' gana). Para operar la caja 2 hay que
+  elegir 'PC-PRUEBAS-C2' a mano en el modal.
+- Al dar de alta otra caja en el mismo worker: `Equipo` nuevo, `IpWorker`
+  de esta PC, y **una fila por recurso** (Tickets/Documentos/TerminalBanorte).
+  NO usar el mismo `Equipo` de otra caja — viola el índice único
+  (`Cannot insert duplicate key ... IX_cat_RecursosWorker_Unico`).
+
 ## 3. Endpoints — tabla rápida
 
 Todo bajo `http://<pc>:5000`. `/api/sistema/*` no pide key; el resto sí
@@ -144,11 +180,11 @@ Respuesta real (un objeto por caja con terminal configurada):
   "ipPinpad":"192.168.100.81"},
  {"caja":2,
   "impresoras":[
-    {"recurso":"Tickets","nombreDispositivoLocal":"AJUSTAR_NOMBRE_IMPRESORA_TICKETS","instaladaLocal":false},
+    {"recurso":"Tickets","nombreDispositivoLocal":"generic","instaladaLocal":true},
     {"recurso":"Documentos","nombreDispositivoLocal":"Microsoft Print to PDF","instaladaLocal":true}],
   "terminal":{"cia":1,"sucursal":97,"caja":2,"idTerminal":"PENDIENTE",
     "puerto":"1818","afiliacion":"8626674","usuario":"a8626674","modo":"AUT","origen":"DB"},
-  "ipPinpad":"192.168.3.167"}]
+  "ipPinpad":"192.168.100.81"}]
 ```
 
 - `ipPinpad` = IP que resuelve `cat_RecursosWorker` para esa caja
@@ -186,11 +222,15 @@ Respuesta real:
 ```json
 [{"sucursal":97,"caja":1,"ipTerminal":"192.168.100.81","puerto":"1818",
   "afiliacion":"8626674","usuario":"a8626674","modo":"AUT","online":true},
- {"sucursal":97,"caja":2,"ipTerminal":"192.168.3.167","puerto":"1818",
-  "afiliacion":"8626674","usuario":"a8626674","modo":"AUT","online":false}]
+ {"sucursal":97,"caja":2,"ipTerminal":"192.168.100.81","puerto":"1818",
+  "afiliacion":"8626674","usuario":"a8626674","modo":"AUT","online":true}]
 ```
 
 - `online` = ping TCP real a `ip:puerto` (timeout 800ms, en paralelo).
+- Caja 1 y 2 muestran la misma `ipTerminal` porque **comparten la pinpad
+  física** `192.168.100.81` (ver "Mismo worker, varias cajas" en §2). Si la
+  caja 2 tuviera su propia pinpad, solo cambia `NombreDispositivoLocal` de
+  su recurso `TerminalBanorte`.
 - Sin `sucursal` lista **todas** las terminales de la empresa (en esta base
   hay 11: sucursales 1-7, 97 x2, 99 y 203).
 - `ipTerminal` = recurso `'TerminalBanorte'` de esa caja; si no existe,
