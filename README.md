@@ -5,6 +5,7 @@ Expone HTTP en `http://<caja>:5000` para:
 
 - **Impresión** — tickets ESC/POS (`/api/impresion/*`) y PDF vía SumatraPDF.
 - **Terminal Banorte/Payworks** — pinpad Ingenico por red (`/api/terminal/*`).
+- **Biometría** — lector de huellas DigitalPersona U.are.U (`/api/biometria/*`).
 - **Sistema** — identidad/health (`/api/sistema/*`).
 
 Toda ruta `/api/*` (excepto `/api/sistema`) exige header `X-Worker-Key`
@@ -215,7 +216,52 @@ curl -X POST "$B/verificar" -H "X-Worker-Key: $K" -H "Content-Type: application/
 # estado "VTA": estatus interno A->200 aplicada; D/R/C/otro->400 con detalle
 ```
 
-## 5. Errores y timeouts
+## 5. Biometría — Lector de huellas DigitalPersona
+
+### 5.1 Requisitos en el equipo
+
+- Lector U.are.U por USB + **runtime nativo del SDK** (`DPFPApi.dll`,
+  `dpHFtrEx.dll`, `dpHMatch.dll`), que instala el "U.are.U SDK" de
+  DigitalPersona. Los wrappers managed (`DPFP*NET.dll`, AnyCPU v1.6.1)
+  viven en `libs\DigitalPersona\` y se copian al publicar (`Private=true`).
+- `cberp.dbo.cat_nomina_trabajadores.huella` (`varbinary(max)`): bytes
+  crudos de `DPFP.Template` — el mismo formato que guarda `PruebaHuella.exe`.
+- Sin lector o sin runtime nativo → `503` (nunca `500`).
+
+### 5.2 `appsettings.json` → `Biometria`
+
+```json
+"Biometria": {
+  "TimeoutCapturaSegundos": 15,      // espera maxima por muestra -> 408
+  "CacheHuellasMinutos": 10,         // TTL del padron en memoria (1:N)
+  "ArchivoCacheLocal": "C:\\berllanoWorker\\data\\huellas_cache.json",
+  "GuardarEnrolamientoEnBd": false   // true = UPDATE a cat_nomina_trabajadores
+}
+```
+
+- `ArchivoCacheLocal`: respaldo JSON/base64 del padrón si cberp no responde.
+- `GuardarEnrolamientoEnBd`: `false` devuelve el Base64 para que la API lo
+  persista; `true` hace el `UPDATE ... SET huella=@h, huella_foto=@h` aquí.
+
+### 5.3 Endpoints `/api/biometria` — curls
+
+```powershell
+$B = "http://localhost:5000/api/biometria"
+
+# 1:1 -> 200 "1" | "0"   (404 si el empleado no tiene huella registrada)
+curl -X POST "$B/verificar/0003" -H "X-Worker-Key: $K"
+
+# 1:N -> 200 { "claveEmpleado": "0003" }   (404 si nadie coincide)
+curl -X POST "$B/identificar" -H "X-Worker-Key: $K"
+
+# Enrolar -> 200 "<base64 del DPFP.Template>"
+curl -X POST "$B/huella" -H "X-Worker-Key: $K" -H "Content-Type: application/json" -d '{"empleado":"0003"}'
+```
+
+Un solo lector físico: las capturas se serializan con semáforo; una segunda
+petición concurrente → `423`. `408` si no hay dedo en `TimeoutCapturaSegundos`.
+
+## 6. Errores y timeouts
 
 | HTTP | Causa |
 |---|---|
@@ -239,7 +285,7 @@ Detalles de implementación que conviene saber:
 - `CANCELAR` NO consulta transacciones: es solo `PPSendTxn(3)` de reset de sesión.
 - Locks internos del exe: 30s venta/cashback/llave, 15s verificación, 3s cancelar.
 
-## 6. Pruebas de humo en sucursal
+## 7. Pruebas de humo en sucursal
 
 ```powershell
 # Como Admin, en la caja con pinpad real:

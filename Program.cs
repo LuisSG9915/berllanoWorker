@@ -35,6 +35,7 @@ builder.Services.AddCors(options =>
 builder.Services.AddSingleton<IConfiguracionCajaService, ConfiguracionCajaService>();
 builder.Services.AddSingleton<IImpresionService, ImpresionService>();
 builder.Services.AddSingleton<ITerminalService, TerminalService>();
+builder.Services.AddSingleton<IBiometriaService, BiometriaService>();
 
 builder.Services.AddControllers(options =>
 {

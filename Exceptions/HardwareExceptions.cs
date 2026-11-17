@@ -35,3 +35,11 @@ public class HardwareValidationException : HardwareException
     public override int StatusCode => StatusCodes.Status422UnprocessableEntity;
     public HardwareValidationException(string message) : base(message) { }
 }
+
+// 404: el recurso existe, pero no hay datos que lo respalden (empleado sin
+// huella registrada, huella no identificada contra el padron).
+public class HardwareNotFoundException : HardwareException
+{
+    public override int StatusCode => StatusCodes.Status404NotFound;
+    public HardwareNotFoundException(string message) : base(message) { }
+}

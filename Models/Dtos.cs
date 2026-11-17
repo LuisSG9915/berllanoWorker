@@ -66,6 +66,8 @@ public class IdentidadDto
     public int Puerto { get; set; }
     public string Version { get; set; } = string.Empty;
     public string Status { get; set; } = "ONLINE";
+    public int CajaDefault { get; set; }
+    public int SucursalDefault { get; set; }
 }
 
 // Overrides opcionales por peticion. sucursal/caja seleccionan la fila de
@@ -320,6 +322,20 @@ public class ImprimirVoucherRequestDto : TerminalConfigOverrideDto
 
     [JsonPropertyName("voucher_lineas")]
     public List<VoucherLineaDto>? VoucherLineas { get; set; }
+}
+
+// POST /api/biometria/huella -> { "empleado": "0003" }
+public class BiometriaHuellaRequestDto
+{
+    [JsonPropertyName("empleado")]
+    public string Empleado { get; set; } = string.Empty;
+}
+
+// Respuesta de POST /api/biometria/identificar -> { "claveEmpleado": "0003" }
+public class BiometriaIdentificarResponseDto
+{
+    [JsonPropertyName("claveEmpleado")]
+    public string ClaveEmpleado { get; set; } = string.Empty;
 }
 
 

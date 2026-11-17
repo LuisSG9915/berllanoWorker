@@ -8,6 +8,9 @@
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <Version>1.0.0</Version>
     <RootNamespace>berllanoWorker</RootNamespace>
+    <!-- DPFPDevNET (SDK DigitalPersona 1.6.1) referencia System.Windows.Forms
+         en algunos tipos; el framework ref evita sorpresas al JIT en servicio. -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +20,27 @@
     <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.0" />
+  </ItemGroup>
+
+  <!-- SDK DigitalPersona U.are.U (v1.6.1, AnyCPU) para el modulo de biometria.
+       Private=true -> se copian al publicar junto al worker. -->
+  <ItemGroup>
+    <Reference Include="DPFPDevNET">
+      <HintPath>libs\DigitalPersona\DPFPDevNET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DPFPEngNET">
+      <HintPath>libs\DigitalPersona\DPFPEngNET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DPFPShrNET">
+      <HintPath>libs\DigitalPersona\DPFPShrNET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DPFPVerNET">
+      <HintPath>libs\DigitalPersona\DPFPVerNET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

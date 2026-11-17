@@ -31,7 +31,9 @@ public class SistemaController : ControllerBase
             IpsLan = NetworkInfoHelper.ObtenerIpsLan(),
             Puerto = _configuration.GetValue("Worker:Puerto", 5000),
             Version = NetworkInfoHelper.ObtenerVersion(),
-            Status = "ONLINE"
+            Status = "ONLINE",
+            CajaDefault = _configuration.GetValue("CajaLocal:CajaDefault", 1),
+            SucursalDefault = _configuration.GetValue("CajaLocal:SucursalDefault", 1)
         };
         return Ok(dto);
     }
