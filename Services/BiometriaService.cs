@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Channels;
 using berllanoWorker.Exceptions;
@@ -295,9 +296,9 @@ public class BiometriaService : IBiometriaService
     {
         try
         {
-            // Con este SDK (1.6.1) no hay ReadersCollection: si no hay lector
-            // el ctor o StartCapture lanzan excepcion -> 503.
-            return new CapturaSesion();
+            // Si no hay lector conectado, el ctor de Capture/StartCapture
+            // lanza excepcion -> 503.
+            return new CapturaSesion(_logger);
         }
         catch (Exception ex)
         {
@@ -307,23 +308,96 @@ public class BiometriaService : IBiometriaService
     }
 
     // Sesion de captura: UNA instancia de DPFP.Capture.Capture por operacion.
-    // El SDK entrega cada muestra por eventos en su propio hilo; se puentea a
-    // un Channel<Sample> para esperar la siguiente muestra de forma asincrona.
-    // En enrolamiento la misma sesion cubre las N muestras y se libera una
-    // sola vez en DisposeAsync.
+    // El SDK 1.6.1 entrega los eventos de dedo a traves de la cola de mensajes
+    // de Windows del hilo que lo crea (SDK orientado a WinForms): sin message
+    // pump OnReaderConnect llega (sincrono) pero OnFingerTouch/OnComplete se
+    // quedan encolados. Por eso el Capture vive en un hilo STA dedicado que
+    // bombea mensajes; cada muestra se puentea a un Channel<Sample> para
+    // esperarla de forma asincrona. En enrolamiento la misma sesion cubre las
+    // N muestras y se libera una sola vez en DisposeAsync.
     private sealed class CapturaSesion : IAsyncDisposable
     {
-        private readonly Capture _capture;
+        private readonly ILogger _logger;
         private readonly Channel<MuestraCapturada> _canal = Channel.CreateUnbounded<MuestraCapturada>();
+        private readonly Thread _pump;
+        private readonly ManualResetEventSlim _ready = new();
+        private volatile bool _stopPump;
+        private Exception? _startError;
         private HardwareException? _error;
 
         private sealed record MuestraCapturada(Sample? Sample, HardwareException? Error);
 
-        public CapturaSesion()
+        public CapturaSesion(ILogger logger)
         {
-            _capture = new Capture();
-            _capture.EventHandler = new Handler(this);
-            _capture.StartCapture();
+            _logger = logger;
+            _pump = new Thread(PumpLoop) { IsBackground = true, Name = "dpfp-capture" };
+            _pump.SetApartmentState(ApartmentState.STA);
+            _pump.Start();
+            _ready.Wait();
+            if (_startError is not null) throw _startError;
+        }
+
+        // Hilo que crea el Capture y despacha la cola de mensajes de Windows:
+        // aqui es donde el SDK entrega los eventos del lector.
+        private void PumpLoop()
+        {
+            Capture? capture = null;
+            try
+            {
+                // Con Priority.Normal DpHost retiene las muestras y los eventos
+                // de dedo nunca llegan (solo OnReaderConnect). High es la unica
+                // prioridad que entrega OnFingerTouch/OnComplete en este runtime.
+                var serial = ResolverSerialLector();
+                capture = serial is not null
+                    ? new Capture(serial, Priority.High)
+                    : new Capture(Priority.High);
+                capture.EventHandler = new Handler(this);
+                capture.StartCapture();
+                _ready.Set();
+
+                var msg = new NativeMethods.MSG();
+                while (!_stopPump)
+                {
+                    while (NativeMethods.PeekMessage(out msg, IntPtr.Zero, 0, 0, NativeMethods.PM_REMOVE))
+                    {
+                        NativeMethods.TranslateMessage(ref msg);
+                        NativeMethods.DispatchMessage(ref msg);
+                    }
+                    Thread.Sleep(3);
+                }
+            }
+            catch (Exception ex)
+            {
+                _startError = ex;
+                _ready.Set();
+            }
+
+            // Limpieza en el MISMO hilo que creo el Capture.
+            try { capture?.StopCapture(); } catch { /* ya detenido */ }
+            try { if (capture is not null) capture.EventHandler = null; } catch { }
+            try { capture?.Dispose(); } catch { }
+        }
+
+        // Serial del lector fisico (ej. "{E5A18298-...}") o null si no hay
+        // ninguno: el ctor de Capture tambien acepta el "default" pero ligarlo
+        // explicitamente evita depender del orden de enumeracion.
+        private string? ResolverSerialLector()
+        {
+            try
+            {
+                var readers = new ReadersCollection();
+                readers.Refresh();
+                foreach (var desc in readers.Values)
+                {
+                    if (!string.IsNullOrWhiteSpace(desc?.SerialNumber))
+                        return desc.SerialNumber;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("No se pudo enumerar lectores DPFP: {Msg}", ex.Message);
+            }
+            return null;
         }
 
         public async Task<Sample> SiguienteMuestraAsync(TimeSpan timeout, CancellationToken ct)
@@ -360,9 +434,9 @@ public class BiometriaService : IBiometriaService
         public ValueTask DisposeAsync()
         {
             // Limpieza best-effort: NUNCA debe lanzar ni enmascarar el resultado.
-            try { _capture.StopCapture(); } catch { /* ya detenido */ }
-            try { _capture.EventHandler = null; } catch { }
-            try { _capture.Dispose(); } catch { }
+            // El StopCapture/Dispose lo hace el hilo pump al salir del bucle.
+            _stopPump = true;
+            try { _pump.Join(TimeSpan.FromSeconds(5)); } catch { }
             _canal.Writer.TryComplete();
             return ValueTask.CompletedTask;
         }
@@ -385,16 +459,58 @@ public class BiometriaService : IBiometriaService
             public Handler(CapturaSesion sesion) => _sesion = sesion;
 
             public void OnComplete(object capture, string readerSerialNumber, Sample sample)
-                => _sesion.ReportarMuestra(sample);
+            {
+                _sesion._logger.LogInformation("[DPFP] OnComplete reader={Serial}", readerSerialNumber);
+                _sesion.ReportarMuestra(sample);
+            }
 
             public void OnReaderDisconnect(object capture, string readerSerialNumber)
-                => _sesion.ReportarError(new HardwareDisconnectedException(
+            {
+                _sesion._logger.LogWarning("[DPFP] OnReaderDisconnect reader={Serial}", readerSerialNumber);
+                _sesion.ReportarError(new HardwareDisconnectedException(
                     "El lector de huellas se desconecto durante la captura."));
+            }
 
-            public void OnFingerGone(object capture, string readerSerialNumber) { }
-            public void OnFingerTouch(object capture, string readerSerialNumber) { }
-            public void OnReaderConnect(object capture, string readerSerialNumber) { }
-            public void OnSampleQuality(object capture, string readerSerialNumber, CaptureFeedback feedback) { }
+            public void OnFingerGone(object capture, string readerSerialNumber)
+                => _sesion._logger.LogInformation("[DPFP] OnFingerGone reader={Serial}", readerSerialNumber);
+
+            public void OnFingerTouch(object capture, string readerSerialNumber)
+                => _sesion._logger.LogInformation("[DPFP] OnFingerTouch reader={Serial}", readerSerialNumber);
+
+            public void OnReaderConnect(object capture, string readerSerialNumber)
+                => _sesion._logger.LogInformation("[DPFP] OnReaderConnect reader={Serial}", readerSerialNumber);
+
+            public void OnSampleQuality(object capture, string readerSerialNumber, CaptureFeedback feedback)
+                => _sesion._logger.LogInformation("[DPFP] OnSampleQuality reader={Serial} feedback={Feedback}",
+                    readerSerialNumber, feedback);
+        }
+
+        // Bomba de mensajes Win32 para despachar los eventos del SDK DPFP.
+        private static class NativeMethods
+        {
+            public const uint PM_REMOVE = 0x0001;
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct MSG
+            {
+                public IntPtr hwnd;
+                public IntPtr message;
+                public IntPtr wParam;
+                public IntPtr lParam;
+                public uint time;
+                public int pt_x;
+                public int pt_y;
+            }
+
+            [DllImport("user32.dll")]
+            public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd,
+                uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+
+            [DllImport("user32.dll")]
+            public static extern bool TranslateMessage(ref MSG lpMsg);
+
+            [DllImport("user32.dll")]
+            public static extern IntPtr DispatchMessage(ref MSG lpMsg);
         }
     }
 
@@ -445,7 +561,7 @@ public class BiometriaService : IBiometriaService
         const string sql = """
             SELECT huella
             FROM dbo.cat_nomina_trabajadores WITH (NOLOCK)
-            WHERE clave_empleado = @emp AND status = 1
+            WHERE clave_empleado = @emp AND status <> 2
               AND huella IS NOT NULL AND DATALENGTH(huella) > 0;
             """;
         try
@@ -471,11 +587,11 @@ public class BiometriaService : IBiometriaService
 
     private async Task<Dictionary<string, EntradaHuella>> ConsultarHuellasBdAsync(CancellationToken ct)
     {
-        // status = 1 -> personal activo (el historico/bajas vive en status 2).
+        // status <> 2 -> personal activo (el historico/bajas vive en status 2).
         const string sql = """
             SELECT clave_empleado, huella
             FROM dbo.cat_nomina_trabajadores WITH (NOLOCK)
-            WHERE status = 1 AND huella IS NOT NULL AND DATALENGTH(huella) > 0;
+            WHERE status <> 2 AND huella IS NOT NULL AND DATALENGTH(huella) > 0;
             """;
         var dict = new Dictionary<string, EntradaHuella>(StringComparer.OrdinalIgnoreCase);
         await using var cn = await AbrirConexionAsync(ct);
@@ -515,7 +631,7 @@ public class BiometriaService : IBiometriaService
         const string sql = """
             SELECT COUNT(1)
             FROM dbo.cat_nomina_trabajadores WITH (NOLOCK)
-            WHERE clave_empleado = @emp AND status = 1;
+            WHERE clave_empleado = @emp AND status <> 1;
             """;
         await using var cn = await AbrirConexionAsync(ct);
         await using var cmd = new SqlCommand(sql, cn) { CommandTimeout = 10 };

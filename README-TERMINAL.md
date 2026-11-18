@@ -10,7 +10,7 @@ sucursal `97` ("PRUEBAS 2"), con la build `f282308` (la última del repo).
 | Dato | Valor real |
 |---|---|
 | PC del worker | `WIN-81AVR1HMBNE` — LAN `192.168.100.54` |
-| Puerto HTTP | `5000` (servicio `berllanoWorker`) |
+| Puerto HTTP | `5000` (`berllanoWorker` — en esta PC corre como app de logon, ver §7.4) |
 | Pinpad | `192.168.100.81:1818` (ingenico Payworks) |
 | Sucursal | `97` = "PRUEBAS 2" |
 | Cajas con terminal | `1` y `2` (ambas `AUT` = sin cargo real) |
@@ -26,7 +26,7 @@ sucursal `97` ("PRUEBAS 2"), con la build `f282308` (la última del repo).
 ```
 PWA / Postman / curl
    └─► POST http://<pc-caja>:5000/api/terminal/*     (header X-Worker-Key)
-        └─► berllanoWorker  (servicio Windows, C:\berllanoWorker)
+        └─► berllanoWorker  (app de logon o servicio Windows, C:\berllanoWorker)
              ├─► lee credenciales de cberp:
              │    t_banorte_usuarios  → usuario/pass/afiliación/modo
              │    cat_RecursosWorker  → IP del pinpad ('TerminalBanorte')
@@ -101,17 +101,21 @@ Todo bajo `http://<pc>:5000`. `/api/sistema/*` no pide key; el resto sí
 | POST | `/api/terminal/cancelacion` | Reset de sesión o devolución financiera real |
 | POST | `/api/terminal/verificar` | Consulta el estado de un `numero_control` en Payworks |
 | POST | `/api/terminal/imprimir-voucher` | Reimprimir voucher (hoy es stub, ver §4.10) |
+| POST | `/api/biometria/huella` | Enrolamiento: captura huella, devuelve plantilla Base64 |
+| POST | `/api/biometria/verificar/{empleado}` | Verificación 1:1 contra la huella en `cat_nomina_trabajadores` |
+| POST | `/api/biometria/identificar` | Identificación 1:N, devuelve la clave del empleado |
+| POST | `/api/biometria/recargar-cache` | Recarga las plantillas desde BD (sin tocar el lector) |
 
 ### Curls reales (sucursal 97, caja 1 — copiar y pegar)
 
 ```powershell
 $B = "http://localhost:5000"
-$K = "b740ecedf34c4cd7885826521ce8ff27"   # WorkerKey real de esta PC de pruebas
+$K = "S     "   # WorkerKey real de esta PC de pruebas
 
 # --- Consultas (no tocan el pinpad) ---
 curl "http://localhost:5000/api/sistema/identidad"
-curl "http://localhost:5000/api/sistema/cajas?sucursal=97" -H "X-Worker-Key: b740ecedf34c4cd7885826521ce8ff27"
-curl "http://localhost:5000/api/terminal/cajas?sucursal=97" -H "X-Worker-Key: b740ecedf34c4cd7885826521ce8ff27"
+curl "http://localhost:5000/api/sistema/cajas?sucursal=97" -H "X-Worker-Key: S"
+curl "http://localhost:5000/api/terminal/cajas?sucursal=97" -H "X-Worker-Key: S"
 curl "http://localhost:5000/api/terminal/terminales?sucursal=97&verificarPing=true" -H "X-Worker-Key: b740ecedf34c4cd7885826521ce8ff27"
 
 # --- Operaciones (SI tocan el pinpad; modo AUT = sin cargo real) ---
@@ -396,6 +400,43 @@ Respuesta real **HTTP 200**:
 > (`TODO` en `TerminalController`). La impresión real del voucher hoy
 > sale por el flujo de §5 (`sp_ticket_banorte` → impresora `Tickets`).
 
+### 4.11 Biometría (lector DigitalPersona U.are.U) — `POST /api/biometria/*`
+
+El enrolamiento captura la huella y devuelve la plantilla lista para
+persistir en `cat_nomina_trabajadores.huella`:
+
+```powershell
+curl -X POST "$B/api/biometria/huella" -H "X-Worker-Key: $K" -H "Content-Type: application/json" `
+  -d '{"empleado":"0003"}'
+```
+
+Respuesta real **HTTP 200** (17-nov-26, U.are.U 4500, 4 toques ~5s) —
+devuelve la plantilla en texto plano:
+
+```text
+APh+Acgq43NcwEE3CatxsLsUVZL9S43XXKDocebqVPxeY3voWc6wXnuB9w5YzfyK...  (Base64)
+```
+
+Si nadie toca en 15s → `408 HardwareTimeoutException`; si el lector se
+desconecta → `503`. Un `408` significa lector vivo esperando el dedo.
+
+| Endpoint | Uso |
+|---|---|
+| `POST /api/biometria/huella` | Alta/enrolamiento → plantilla Base64 |
+| `POST /api/biometria/verificar/{empleado}` | 1:1 contra `cat_nomina_trabajadores.huella` (`1`/`0`) |
+| `POST /api/biometria/identificar` | 1:N → `{ "claveEmpleado": "..." }` o 404 |
+| `POST /api/biometria/recargar-cache` | Recarga plantillas desde BD sin tocar el lector |
+
+Restricciones reales verificadas en esta PC:
+
+- **El lector SOLO funciona en sesión interactiva** (ver §7.4): como servicio
+  Windows (sesión 0, cualquier cuenta) responde al instante
+  `503 HardwareDisconnectedException`. En sesión responde `408`/captura.
+- La PWA enruta estas llamadas con el recurso **`LectorHuella`** de
+  `cat_RecursosWorker` (fila obligatoria para saber a qué PC llamar);
+  el `NombreDispositivoLocal` es informativo — el SDK va directo al USB.
+- El acceso al lector es exclusivo: dos capturas simultáneas → `423`.
+
 ## 5. Qué pasa después de un cobro (post-venta, nuevo)
 
 Cuando el pinpad responde (aprobada o declinada), `POST /cobro` hace dos
@@ -460,6 +501,12 @@ Stop-Service berllanoWorker -Force          # si ya corre
 curl http://localhost:5000/api/sistema/identidad
 ```
 
+Si la PC tiene **lector de huellas** hay que cambiar a modo sesión (§7.4):
+
+```powershell
+.\deploy\install-worker-session.ps1         # corre como admin
+```
+
 Archivos que deben existir en la caja:
 
 ```
@@ -504,10 +551,66 @@ id_afiliacion='8626674', puerto='1818', modo='AUT'
 (1,97,1,'TerminalBanorte')  NombreDispositivoLocal='192.168.100.81'  <- IP pinpad
 (1,97,1,'Tickets')          NombreDispositivoLocal='prueba'
 (1,97,1,'Documentos')       NombreDispositivoLocal='Microsoft Print to PDF'
+(1,97,1,'LectorHuella')     NombreDispositivoLocal='U.are.U Fingerprint Reader'
 ```
+
+### 7.4 Modo sesión (obligatorio si hay lector de huellas)
+
+El lector DigitalPersona (`usbdpfp` / DPFP SDK 1.6.1) **solo expone el
+dispositivo a procesos de la sesión interactiva**. Probado en esta PC:
+
+| Cómo corre el worker | `/api/biometria/huella` |
+|---|---|
+| Servicio Windows (LocalSystem, NetworkService, `.\Administrador`) | `503` al instante (`OnReaderDisconnect`) |
+| App en la sesión del usuario | `408` esperando el dedo / captura OK |
+
+Por eso esta PC corre como **tarea programada de logon** (no servicio).
+Impresión, terminal y biometría comparten el mismo `:5000`.
+
+```powershell
+# instalar/convertir (deshabilita el servicio, crea la tarea AtLogOn):
+.\deploy\install-worker-session.ps1
+
+# operar a mano:
+Start-ScheduledTask berllanoWorker          # arrancar (equivale a logon)
+Stop-Process -Name berllanoWorker -Force    # detener
+Get-ScheduledTask berllanoWorker            # ver estado
+
+# volver a servicio (la huella dejara de funcionar):
+sc.exe config berllanoWorker start= auto
+Disable-ScheduledTask berllanoWorker
+Start-Service berllanoWorker
+```
+
+Detalles:
+
+- La tarea lanza `C:\berllanoWorker\run-worker-hidden.vbs` → ejecuta el
+  worker **sin ventana de consola** (si el cajero cierra una ventana
+  visible mataría el worker).
+- Requiere sesión iniciada: en cajas con autologon no cambia nada; sin
+  logon no hay worker **de nada** (ni impresión ni terminal).
+- Actualizar binarios en este modo: `Stop-Process -Name berllanoWorker`,
+  copiar publish (sin pisar `appsettings.json`) y `Start-ScheduledTask`.
 
 ## 8. Gotchas reales (nos mordieron)
 
+- **Lector de huellas = 3 requisitos no obvios**: con el SDK DPFP 1.6.1
+  hacen falta LOS TRES juntos o la captura muere silenciosa (solo llega
+  `OnReaderConnect`, jamás `OnFingerTouch`/`OnComplete` → 408 eterno):
+  1. **Sesión interactiva** — como servicio Windows (sesión 0, cualquier
+     cuenta) da `503` inmediato. Por eso corre como tarea de logon (§7.4).
+  2. **Message pump** — los eventos llegan por la cola de mensajes de
+     Windows del hilo que crea el `Capture`; un proceso headless sin pump
+     nunca los despacha. `CapturaSesion` usa un hilo STA dedicado con
+     `PeekMessage`/`DispatchMessage` por eso.
+  3. **`Priority.High`** — con la prioridad default (`Normal`), `DpHost`
+     se queda las muestras: conecta pero no entrega. Verificado 17-nov-26:
+     `new Capture(serial, Priority.High)` → 4 muestras + plantilla Base64
+     en ~5s (U.are.U 4500, serial real `e5a18298-…`).
+- **`Equipo` ≠ hostname**: el índice único de `cat_RecursosWorker` es
+  `(IdEmpresa, IdSucursal, Equipo, Recurso)` — `Caja` NO forma parte.
+  Dos cajas en la misma PC necesitan `Equipo` distinto (ej. `PC-PRUEBAS`
+  y `PC-PRUEBAS-C2`) con el mismo `IpWorker`/`HostWorker`.
 - **Decimal de cultura**: el exe parsea el monto con la cultura de Windows
   (coma decimal en esta flota). El worker ya formatea con cultura local;
   no "arreglen" el monto a mano.
