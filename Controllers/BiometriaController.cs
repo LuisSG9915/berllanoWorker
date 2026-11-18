@@ -38,4 +38,12 @@ public class BiometriaController : ControllerBase
         string templateBase64 = await _biometriaService.EnrolarHuellaAsync(request.Empleado, ct);
         return Ok(templateBase64);
     }
+
+    // Fuerza la recarga del padron de huellas desde cberp.
+    [HttpPost("recargar-cache")]
+    public async Task<IActionResult> RecargarCache(CancellationToken ct)
+    {
+        await _biometriaService.RecargarCacheHuellasAsync(ct);
+        return Ok(new { status = 200, mensaje = "Padron de huellas recargado" });
+    }
 }
